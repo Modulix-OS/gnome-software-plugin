@@ -1,0 +1,6 @@
+option(
+  'plugindir',
+  type        : 'string',
+  value       : '',
+  description : 'Plugin install directory (default: gnome-software pkg-config plugindir)',
+)

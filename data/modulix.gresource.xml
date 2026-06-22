@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Resolves to /org/modulix/software/icons/scalable/apps/nix-snowflake.svg
+     so gtk_icon_theme_add_resource_path("/org/modulix/software/icons") finds it. -->
+<gresources>
+  <gresource prefix="/org/modulix/software/icons/scalable/apps">
+    <file alias="nix-snowflake.svg">icons/scalable/apps/nix-snowflake.svg</file>
+  </gresource>
+</gresources>
