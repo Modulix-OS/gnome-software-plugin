@@ -9,12 +9,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # zbus client (+ C shim) for org.modulix.Daemon's Store1/Daemon interfaces —
-    # the plugin's only Rust dependency now (modulix-core-utils is consumed
-    # exclusively by mx-daemon). Points at the local sibling checkout (its
-    # uncommitted, tracked changes are included; `target/` and other untracked
-    # files are not). Switch to the GitHub URL once pushed:
-    #   url = "github:Modulix-OS/modulix-store-client";
     modulix-store-client = {
       url = "git+file:///home/quentin/Programmes/Modulix-OS/modulix-store-client";
       flake = false;
@@ -45,10 +39,6 @@
           version = "0.1.0";
           src = ./.;
 
-          # Vendor the Rust dependencies for an offline cargo build (meson runs
-          # cargo). The crate — and its lockfile — live in the sibling
-          # modulix-store-client checkout, laid out next to the source root by
-          # postUnpack below; cargoRoot is relative to that source root.
           cargoDeps = pkgs.rustPlatform.importCargoLock {
             lockFile = "${modulix-store-client}/Cargo.lock";
           };
@@ -77,9 +67,6 @@
             pkgs.libxmlb
           ];
 
-          # meson's custom_target points cargo at `../modulix-store-client`
-          # (see meson.build); lay it out where that resolves, sibling of the
-          # unpacked source root.
           postUnpack = ''
             cp -r --no-preserve=mode,ownership \
               ${modulix-store-client} "$NIX_BUILD_TOP/modulix-store-client"
