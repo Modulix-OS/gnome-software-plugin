@@ -9,18 +9,19 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # The Modulix Rust library the read path links against. Points at the local
-    # sibling checkout (its uncommitted, tracked changes are included; `target/`
-    # and other untracked files are not). Switch to the GitHub URL once the
-    # required additions (version(), list_installed_modules, flatpak table) land:
-    #   url = "github:Modulix-OS/modulix-core-utils";
-    modulix-core-utils = {
-      url = "git+file:///home/quentin/Programmes/Modulix-OS/modulix-core-utils";
+    # zbus client (+ C shim) for org.modulix.Daemon's Store1/Daemon interfaces —
+    # the plugin's only Rust dependency now (modulix-core-utils is consumed
+    # exclusively by mx-daemon). Points at the local sibling checkout (its
+    # uncommitted, tracked changes are included; `target/` and other untracked
+    # files are not). Switch to the GitHub URL once pushed:
+    #   url = "github:Modulix-OS/modulix-store-client";
+    modulix-store-client = {
+      url = "git+file:///home/quentin/Programmes/Modulix-OS/modulix-store-client";
       flake = false;
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, modulix-core-utils }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, modulix-store-client }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -30,6 +31,14 @@
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };
 
+        # gnome-software patched with an explicit "GnomeSoftware::SortKey" metadata
+        # sort key, read *before* the packaging-format-preference GSetting in the
+        # details-page version-selector sort. Lets the Modulix plugin impose
+        # module > Flatpak > nix-variant ordering regardless of user settings.
+        gnome-software-patched = pkgs.gnome-software.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./nix/gs-details-page-sortkey.patch ];
+        });
+
         # ─── The plugin (.so) ───────────────────────────────────────────────
         plugin = pkgs.stdenv.mkDerivation {
           pname = "gnome-software-plugin-modulix";
@@ -37,11 +46,13 @@
           src = ./.;
 
           # Vendor the Rust dependencies for an offline cargo build (meson runs
-          # cargo). The lockfile lives in backend/.
+          # cargo). The crate — and its lockfile — live in the sibling
+          # modulix-store-client checkout, laid out next to the source root by
+          # postUnpack below; cargoRoot is relative to that source root.
           cargoDeps = pkgs.rustPlatform.importCargoLock {
-            lockFile = ./backend/Cargo.lock;
+            lockFile = "${modulix-store-client}/Cargo.lock";
           };
-          cargoRoot = "backend";
+          cargoRoot = "../modulix-store-client";
 
           nativeBuildInputs = [
             pkgs.meson
@@ -53,8 +64,6 @@
             pkgs.rust-cbindgen
             pkgs.gettext # msgfmt: compile po/*.po → *.mo
             pkgs.glib # glib-compile-resources: embed the badge icon
-            pkgs.cmake # libgit2-sys (via git2, pulled by modulix-core-utils)
-            pkgs.perl # openssl-sys
           ];
 
           buildInputs = [
@@ -66,15 +75,14 @@
             pkgs.json-glib
             pkgs.libsoup_3
             pkgs.libxmlb
-            pkgs.openssl
-            pkgs.zlib
           ];
 
-          # The backend's Cargo.toml uses a path dependency `../../modulix-core-utils`;
-          # lay the library out where cargo expects it (sibling of the source root).
+          # meson's custom_target points cargo at `../modulix-store-client`
+          # (see meson.build); lay it out where that resolves, sibling of the
+          # unpacked source root.
           postUnpack = ''
             cp -r --no-preserve=mode,ownership \
-              ${modulix-core-utils} "$NIX_BUILD_TOP/modulix-core-utils"
+              ${modulix-store-client} "$NIX_BUILD_TOP/modulix-store-client"
           '';
 
           env.CARGO_NET_OFFLINE = "true";
@@ -90,7 +98,7 @@
         # add one, so the plugin .so is copied into gnome-software's own
         # plugins-<api> directory. ABI matches: both derive from the same
         # pkgs.gnome-software.
-        gnome-software-modulix = pkgs.gnome-software.overrideAttrs (old: {
+        gnome-software-modulix = gnome-software-patched.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             for d in ${plugin}/lib/gnome-software/plugins-*; do
               install -Dm755 "$d"/*.so -t "$out/lib/gnome-software/$(basename "$d")/"
@@ -109,7 +117,7 @@
         # over the read-only store plugin dir, so no rebuild/root is needed.
         gnome-software-dev = pkgs.writeShellScriptBin "gnome-software-dev" ''
           set -e
-          gs_plugindir=$(echo ${pkgs.gnome-software}/lib/gnome-software/plugins-*)
+          gs_plugindir=$(echo ${gnome-software-patched}/lib/gnome-software/plugins-*)
           local_so=$(echo "''${HOME}"/.local/lib/gnome-software/plugins-*/libgs_plugin_modulix.so)
 
           if [ ! -f "''${local_so}" ]; then
@@ -128,7 +136,7 @@
             --bind "''${HOME}" "''${HOME}" \
             --bind /run/user /run/user \
             --bind "''${tmp}" "''${gs_plugindir}" \
-            ${pkgs.gnome-software}/bin/gnome-software "$@"
+            ${gnome-software-patched}/bin/gnome-software "$@"
         '';
 
       in
@@ -164,8 +172,8 @@
           ];
 
           shellHook = ''
-            export PKG_CONFIG_PATH="${pkgs.gnome-software}/lib/pkgconfig:$PKG_CONFIG_PATH"
-            export GSETTINGS_SCHEMA_DIR="${pkgs.gnome-software}/share/gsettings-schemas/${pkgs.gnome-software.name}:$GSETTINGS_SCHEMA_DIR"
+            export PKG_CONFIG_PATH="${gnome-software-patched}/lib/pkgconfig:$PKG_CONFIG_PATH"
+            export GSETTINGS_SCHEMA_DIR="${gnome-software-patched}/share/gsettings-schemas/${gnome-software-patched.name}:$GSETTINGS_SCHEMA_DIR"
             export G_MESSAGES_DEBUG="GsPluginModulix"
             echo "gnome-software-plugin-modulix dev shell — gnome-software $(pkg-config --modversion gnome-software 2>/dev/null)"
             echo "  just build / just install-dev / just run-gs"

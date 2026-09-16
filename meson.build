@@ -24,6 +24,7 @@ gobject_dep        = dependency('gobject-2.0')
 gio_dep            = dependency('gio-2.0')
 gio_unix_dep       = dependency('gio-unix-2.0')
 gtk4_dep           = dependency('gtk4')
+gdk_pixbuf_dep     = dependency('gdk-pixbuf-2.0')
 appstream_dep      = dependency('appstream', version : '>= 1.0')
 json_glib_dep      = dependency('json-glib-1.0')
 libsoup_dep        = dependency('libsoup-3.0')
@@ -43,29 +44,29 @@ if plugindir == ''
   plugindir = get_option('libdir') / 'gnome-software' / plugins_subdir
 endif
 
-# ─── Rust backend: static lib + cbindgen header (one target, two outputs) ─────
+# ─── Rust store client: static lib + cbindgen header (one target, two outputs)
 
-backend_src      = meson.current_source_dir() / 'backend'
+store_client_src = meson.current_source_dir() / '..' / 'modulix-store-client'
 cargo_target_dir = meson.current_build_dir() / 'cargo-target'
 
-backend = custom_target(
-  'backend',
-  output             : ['libbackend.a', 'backend.h'],
+store_client = custom_target(
+  'modulix-store-client',
+  output             : ['libmodulix_store_client.a', 'modulix-store-client.h'],
   console            : true,
   build_by_default   : true,
   build_always_stale : true,
   command : [
     'sh', '-c',
-    'set -e; "@0@" build --release --manifest-path "@1@/Cargo.toml" --target-dir "@2@"; cp "@2@/release/libbackend.a" "@OUTPUT0@"; "@3@" --quiet --config "@1@/cbindgen.toml" --crate backend --output "@OUTPUT1@" "@1@"'.format(
-      cargo.full_path(), backend_src, cargo_target_dir, cbindgen.full_path()),
+    'set -e; "@0@" build --release --manifest-path "@1@/Cargo.toml" --target-dir "@2@"; cp "@2@/release/libmodulix_store_client.a" "@OUTPUT0@"; "@3@" --quiet --config "@1@/cbindgen.toml" --crate modulix-store-client --output "@OUTPUT1@" "@1@"'.format(
+      cargo.full_path(), store_client_src, cargo_target_dir, cbindgen.full_path()),
   ],
 )
-backend_header = backend[1]
+store_client_header = store_client[1]
 
-backend_dep = declare_dependency(
+store_client_dep = declare_dependency(
   link_args : [
     '-L' + meson.current_build_dir(),
-    '-lbackend',
+    '-lmodulix_store_client',
     '-lpthread', '-ldl', '-lm',
   ],
 )
@@ -77,6 +78,8 @@ plugin_sources = files(
   'plugin/src/gs-modulix-app.c',
   'plugin/src/gs-modulix-enrichment-cache.c',
   'plugin/src/gs-modulix-icon-cache.c',
+  'plugin/src/gs-modulix-icon-resolver.c',
+  'plugin/src/gs-modulix-plugins-cache.c',
   'plugin/src/gs-modulix-json-utils.c',
   'plugin/src/gs-modulix-markup.c',
 )
@@ -90,7 +93,7 @@ modulix_resources = gnome.compile_resources(
 
 shared_module(
   'gs_plugin_modulix',
-  sources : [plugin_sources, backend_header, modulix_resources],
+  sources : [plugin_sources, store_client_header, modulix_resources],
   dependencies : [
     gnome_software_dep,
     glib_dep,
@@ -98,11 +101,12 @@ shared_module(
     gio_dep,
     gio_unix_dep,
     gtk4_dep,
+    gdk_pixbuf_dep,
     appstream_dep,
     json_glib_dep,
     libsoup_dep,
     xmlb_dep,
-    backend_dep,
+    store_client_dep,
   ],
   install     : true,
   install_dir : plugindir,

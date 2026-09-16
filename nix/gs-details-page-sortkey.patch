@@ -1,0 +1,29 @@
+--- a/src/gs-details-page.c	2026-09-13 00:05:04.030855555 +0200
++++ b/src/gs-details-page.c	2026-09-13 00:05:09.042380201 +0200
+@@ -739,6 +739,13 @@
+ 	return 0;
+ }
+ 
++static gint64
++gs_details_page_get_app_sort_key (GsApp *app)
++{
++	const gchar *value = gs_app_get_metadata_item (app, "GnomeSoftware::SortKey");
++	return value != NULL ? g_ascii_strtoll (value, NULL, 10) : 1000;
++}
++
+ static gint
+ sort_by_packaging_format_preference (GsApp *app1,
+ 				     GsApp *app2,
+@@ -746,6 +753,12 @@
+ {
+ 	GsDetailsPage *self = user_data;
+ 	gint index1, index2;
++	gint64 key1, key2;
++
++	key1 = gs_details_page_get_app_sort_key (app1);
++	key2 = gs_details_page_get_app_sort_key (app2);
++	if (key1 != key2)
++		return key1 < key2 ? -1 : 1;
+ 
+ 	index1 = gs_details_page_get_app_packaging_format_preference_index (self, app1);
+ 	index2 = gs_details_page_get_app_packaging_format_preference_index (self, app2);

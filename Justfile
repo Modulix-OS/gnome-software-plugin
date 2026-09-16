@@ -3,7 +3,7 @@
 build_dir := "build"
 prefix    := env_var_or_default("HOME", "/tmp") + "/.local"
 
-# Configure + build (meson drives cargo + cbindgen for the Rust backend).
+# Configure + build (meson drives cargo + cbindgen for modulix-store-client).
 build:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -32,15 +32,15 @@ run-gs-log: install-dev
     G_MESSAGES_DEBUG=all gnome-software-dev --verbose 2>&1 \
         | grep -iE "modulix|GsPlugin|error|warning|crash|segfault"
 
-# Backend crate: test / lint / format.
+# modulix-store-client crate (sibling checkout): test / lint / format.
 test:
-    cargo test --manifest-path backend/Cargo.toml
+    cargo test --manifest-path ../modulix-store-client/Cargo.toml
 
 lint:
-    cargo clippy --manifest-path backend/Cargo.toml -- -D warnings
+    cargo clippy --manifest-path ../modulix-store-client/Cargo.toml -- -D warnings
 
 fmt:
-    cargo fmt --manifest-path backend/Cargo.toml
+    cargo fmt --manifest-path ../modulix-store-client/Cargo.toml
 
 # Build the combined gnome-software + plugin package via the flake.
 build-package:
@@ -60,4 +60,4 @@ check-plugin: install-dev
 
 clean:
     rm -rf {{build_dir}}
-    cargo clean --manifest-path backend/Cargo.toml
+    cargo clean --manifest-path ../modulix-store-client/Cargo.toml

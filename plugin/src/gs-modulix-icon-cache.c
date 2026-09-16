@@ -31,8 +31,10 @@ gchar *gs_modulix_icon_cache_get(const gchar *app_id) {
 }
 
 void gs_modulix_icon_cache_clear(void) {
+  /* Never g_rw_lock_clear() a static GRWLock here: GNOME Software can
+   * unload and reload this plugin within the same process, and a later
+   * put/get would then lock a destroyed lock. */
   g_rw_lock_writer_lock(&icon_cache_lock);
   g_clear_pointer(&icon_cache, g_hash_table_unref);
   g_rw_lock_writer_unlock(&icon_cache_lock);
-  g_rw_lock_clear(&icon_cache_lock);
 }

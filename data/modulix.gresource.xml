@@ -4,5 +4,6 @@
 <gresources>
   <gresource prefix="/org/modulix/software/icons/scalable/apps">
     <file alias="nix-snowflake.svg">icons/scalable/apps/nix-snowflake.svg</file>
+    <file alias="modulix-logo.svg">icons/scalable/apps/modulix-logo.svg</file>
   </gresource>
 </gresources>
