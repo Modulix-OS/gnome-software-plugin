@@ -122,6 +122,7 @@
             --dev /dev --proc /proc --tmpfs /tmp \
             --bind "''${HOME}" "''${HOME}" \
             --bind /run/user /run/user \
+            --ro-bind-try /var/lib/flatpak /var/lib/flatpak \
             --bind "''${tmp}" "''${gs_plugindir}" \
             ${gnome-software-patched}/bin/gnome-software "$@"
         '';
