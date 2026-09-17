@@ -10,7 +10,7 @@
     };
 
     modulix-store-client = {
-      url = "git+file:///home/quentin/Programmes/Modulix-OS/modulix-store-client";
+      url = "github:Modulix-OS/modulix-store-client";
       flake = false;
     };
   };
