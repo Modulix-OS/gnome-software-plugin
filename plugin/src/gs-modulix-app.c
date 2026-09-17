@@ -64,6 +64,12 @@ static guint modulix_match_value(gint score, gboolean is_module) {
 /* ── screenshots ────────────────────────────────────────────────────────── */
 
 void gs_modulix_add_app_screenshots(GsApp *app, JsonObject *meta) {
+  /* A GsApp now outlives the query that produced it (see the plugin cache in
+   * gs_modulix_make_app_from_json), so refine can run on one that already has
+   * its screenshots — appending would show each of them twice. */
+  GPtrArray *existing = gs_app_get_screenshots(app);
+  if (existing != NULL && existing->len > 0)
+    return;
   if (!json_object_has_member(meta, "screenshots"))
     return;
   JsonNode *node = json_object_get_member(meta, "screenshots");
@@ -123,9 +129,25 @@ GIcon *gs_modulix_remote_icon_new(const gchar *url) {
 
 /* ── GsApp construction ─────────────────────────────────────────────────── */
 
+/* States owned by an install/uninstall already under way (`enqueue_lifecycle`
+ * in gs-modulix-lifecycle.c sets them on the main thread, the drain worker
+ * resolves them later). A listing that happens to run in between must not
+ * stamp the daemon's — necessarily pre-operation — state over them. */
+static gboolean state_is_transient(GsAppState state) {
+  switch (state) {
+  case GS_APP_STATE_INSTALLING:
+  case GS_APP_STATE_REMOVING:
+  case GS_APP_STATE_QUEUED_FOR_INSTALL:
+  case GS_APP_STATE_PURCHASING:
+  case GS_APP_STATE_DOWNLOADING:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
 GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
-                                     gboolean is_installed,
-                                     gboolean label_variant) {
+                                     gboolean is_installed) {
   const gchar *name      = gs_modulix_json_str(obj, "name");
   const gchar *base_name = gs_modulix_json_str(obj, "base_name");
   const gchar *pname     = gs_modulix_json_str(obj, "pname");
@@ -150,27 +172,68 @@ GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
 
   gboolean is_module = (g_strcmp0(kind, "module") == 0);
 
+  /* The daemon stamps `installed` on every entry it emits, on every path
+   * (modulix-daemon/src/store/entry.rs). `is_installed` is only the fallback
+   * for a daemon predating that field: before it, the caller's path decided
+   * the state, so search results and Sources-popover rows were born
+   * AVAILABLE no matter what the system actually had installed. */
+  gboolean installed = json_object_has_member(obj, "installed")
+                           ? gs_modulix_json_bool(obj, "installed")
+                           : is_installed;
+
   /* The GsApp id is the backend's grouping key (group_id): the AppStream id
    * when known, else the pname — this is what stacks same-pname variants and a
    * package's extra outputs into one row. Falls back to app_id then name. */
   const gchar *app_unique_id = (group_id && *group_id) ? group_id
                                : (app_id && *app_id)    ? app_id
                                                         : name;
-  GsApp *app = gs_app_new(app_unique_id);
+  /* One GsApp per (kind, install identifier), reused across queries through
+   * the plugin cache — the same pattern gs-plugin-flatpak/packagekit/epiphany
+   * use. The key is deliberately *not* the GsApp id: the alternate_of path
+   * emits several entries sharing one id so they stack in the Sources popover
+   * (see gs-modulix-list.c). `name` — the nix attribute or module name — is
+   * what is unique per entry, and what install/uninstall act on. Same \x1f
+   * separator as gs-modulix-lifecycle.c's run_group()'s dedup key.
+   *
+   * Reuse is what keeps state alive across queries. gs-details-page.c swaps
+   * its displayed app for the matching row of the alternate_of reply
+   * (_set_app() in gs_details_page_get_alternates_cb), and that reply is
+   * re-issued when the page reloads after an install: a freshly built
+   * instance would arrive AVAILABLE and flip the button back to "Install"
+   * the moment the install finished.
+   *
+   * gs_plugin_cache_{lookup,add} each take the loader's cache mutex, but the
+   * miss-then-insert pair must be atomic *as a whole*: gs_details_page_reload
+   * fires the refine job and the alternate_of list job in parallel, both
+   * landing on worker threads, so two threads can miss the same key, both
+   * gs_app_new(), and the second gs_plugin_cache_add() evict the first — the
+   * UI would then hold an instance the cache no longer hands out, which is
+   * exactly the stale-state bug the cache exists to prevent. */
+  g_autofree gchar *cache_key =
+      g_strdup_printf("%s\x1f%s", (kind && *kind) ? kind : "package", name);
+  static GMutex cache_key_mutex;
+  GsApp *app;
+  {
+    g_autoptr(GMutexLocker) locker = g_mutex_locker_new(&cache_key_mutex);
+    app = gs_plugin_cache_lookup(plugin, cache_key);
+    if (app == NULL) {
+      app = gs_app_new(app_unique_id);
+      gs_plugin_cache_add(plugin, cache_key, app);
+    }
+  }
 
   gs_app_set_management_plugin(app, plugin);
 
-  const gchar *fallback_name = (pname && *pname) ? pname : name;
-  g_autofree gchar *display_name = NULL;
-  if (label_variant && !is_module && app_id && *app_id && a_name && *a_name)
-    display_name = g_strdup_printf("%s (%s)", a_name, fallback_name);
-  gs_app_set_name(app, GS_APP_QUALITY_NORMAL,
-                  display_name ? display_name : fallback_name);
+  const gchar *display_name = (a_name && *a_name)   ? a_name
+                              : (pname && *pname)    ? pname
+                                                      : name;
+  gs_app_set_name(app, GS_APP_QUALITY_NORMAL, display_name);
   gs_app_set_summary(app, GS_APP_QUALITY_NORMAL, summary);
   gs_app_set_kind(app, AS_COMPONENT_KIND_DESKTOP_APP);
   gs_app_set_scope(app, AS_COMPONENT_SCOPE_SYSTEM);
-  gs_app_set_state(app, is_installed ? GS_APP_STATE_INSTALLED
-                                     : GS_APP_STATE_AVAILABLE);
+  if (!state_is_transient(gs_app_get_state(app)))
+    gs_app_set_state(app, installed ? GS_APP_STATE_INSTALLED
+                                    : GS_APP_STATE_AVAILABLE);
   gs_app_set_bundle_kind(app, AS_BUNDLE_KIND_PACKAGE);
 
   {
@@ -201,7 +264,12 @@ GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
     }
   }
 
-  if (gs_modulix_icon_resolve(app, app_id, icon_name, name, base_name, icon))
+  /* Only ever once per GsApp: the resolver's contract is that an app carries
+   * exactly one GIcon (see CLAUDE.md, "Icons"), which replaying it on a
+   * cached instance would break — a second, differently-sized icon would let
+   * gs_app_get_icon_for_size()'s first pass win over the themed one. */
+  if (!gs_app_has_icons(app) &&
+      gs_modulix_icon_resolve(app, app_id, icon_name, name, base_name, icon))
     g_object_set_data(G_OBJECT(app), "modulix::icon-themed", GINT_TO_POINTER(1));
 
   gs_app_set_origin(app, is_module ? "modulix" : name);
@@ -239,51 +307,70 @@ GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
   return app;
 }
 
+/* ── ownership / kind accessors ─────────────────────────────────────────── */
+
+gboolean gs_modulix_app_is_ours(GsApp *app, GsPlugin *plugin) {
+  return gs_app_has_management_plugin(app, plugin);
+}
+
+const gchar *gs_modulix_app_kind(GsApp *app) {
+  return g_object_get_data(G_OBJECT(app), "modulix::kind");
+}
+
+const gchar *gs_modulix_app_name(GsApp *app) {
+  return g_object_get_data(G_OBJECT(app), "modulix::name");
+}
+
 /* ── module plugins ─────────────────────────────────────────────────────── */
 
 void gs_modulix_add_module_plugins(GsApp *module_app, const gchar *module_name,
                                    GsPlugin *plugin) {
+  /* Same reason as gs_modulix_add_app_screenshots(): a cached GsApp can be
+   * refined more than once. There is no public addon getter
+   * (gs_app_dup_addons lives in the unexported gs-app-private.h), so the
+   * "already done" bit is kept on the app itself. */
+  if (g_object_get_data(G_OBJECT(module_app), "modulix::addons-added"))
+    return;
+
   g_autofree gchar *json = gs_modulix_plugins_cache_get_or_fetch(module_name);
   if (json == NULL)
     return;
 
   g_autoptr(JsonParser) parser = json_parser_new();
-  g_autoptr(GError) err = NULL;
-  if (!json_parser_load_from_data(parser, json, -1, &err)) {
-    g_warning("[modulix] parse plugins JSON: %s", err->message);
+  JsonArray *array = gs_modulix_json_parse_array(parser, json, "plugins");
+  if (array == NULL)
     return;
+
+  g_autoptr(GsAppList) addons = gs_app_list_new();
+  for (guint i = 0; i < json_array_get_length(array); i++) {
+    JsonObject *obj = json_array_get_object_element(array, i);
+    const gchar *pname = gs_modulix_json_str(obj, "name");
+    const gchar *desc = gs_modulix_json_str(obj, "description");
+    if (!pname || !*pname)
+      continue;
+
+    g_autofree gchar *id = g_strdup_printf("%s/%s", module_name, pname);
+    GsApp *addon = gs_app_new(id);
+    gs_app_set_management_plugin(addon, plugin);
+    gs_app_set_name(addon, GS_APP_QUALITY_NORMAL, pname);
+    gs_app_set_summary(addon, GS_APP_QUALITY_NORMAL, desc);
+    gs_app_set_kind(addon, AS_COMPONENT_KIND_ADDON);
+    gs_app_set_state(addon, GS_APP_STATE_AVAILABLE);
+    gs_app_set_bundle_kind(addon, AS_BUNDLE_KIND_PACKAGE);
+    g_object_set_data_full(G_OBJECT(addon), "modulix::kind", g_strdup("plugin"),
+                           g_free);
+    g_object_set_data_full(G_OBJECT(addon), "modulix::parent",
+                           g_strdup(module_name), g_free);
+    g_object_set_data_full(G_OBJECT(addon), "modulix::plugin_name",
+                           g_strdup(pname), g_free);
+    gs_app_list_add(addons, addon);
+    g_object_unref(addon);
   }
 
-  JsonNode *root = json_parser_get_root(parser);
-  if (root && JSON_NODE_HOLDS_ARRAY(root)) {
-    g_autoptr(GsAppList) addons = gs_app_list_new();
-    JsonArray *array = json_node_get_array(root);
-    for (guint i = 0; i < json_array_get_length(array); i++) {
-      JsonObject *obj = json_array_get_object_element(array, i);
-      const gchar *pname = gs_modulix_json_str(obj, "name");
-      const gchar *desc  = gs_modulix_json_str(obj, "description");
-      if (!pname || !*pname)
-        continue;
-
-      g_autofree gchar *id = g_strdup_printf("%s/%s", module_name, pname);
-      GsApp *addon = gs_app_new(id);
-      gs_app_set_management_plugin(addon, plugin);
-      gs_app_set_name(addon, GS_APP_QUALITY_NORMAL, pname);
-      gs_app_set_summary(addon, GS_APP_QUALITY_NORMAL, desc);
-      gs_app_set_kind(addon, AS_COMPONENT_KIND_ADDON);
-      gs_app_set_state(addon, GS_APP_STATE_AVAILABLE);
-      gs_app_set_bundle_kind(addon, AS_BUNDLE_KIND_PACKAGE);
-      g_object_set_data_full(G_OBJECT(addon), "modulix::kind",
-                             g_strdup("plugin"), g_free);
-      g_object_set_data_full(G_OBJECT(addon), "modulix::parent",
-                             g_strdup(module_name), g_free);
-      g_object_set_data_full(G_OBJECT(addon), "modulix::plugin_name",
-                             g_strdup(pname), g_free);
-      gs_app_list_add(addons, addon);
-      g_object_unref(addon);
-    }
-    if (gs_app_list_length(addons) > 0)
-      gs_app_add_addons(module_app, addons);
+  if (gs_app_list_length(addons) > 0) {
+    gs_app_add_addons(module_app, addons);
+    g_object_set_data(G_OBJECT(module_app), "modulix::addons-added",
+                      GINT_TO_POINTER(1));
   }
 }
 
@@ -292,26 +379,14 @@ void gs_modulix_add_module_plugins(GsApp *module_app, const gchar *module_name,
 void gs_modulix_append_apps_from_json(GsAppList *list, const gchar *json,
                                       GsPlugin *plugin, gboolean is_installed,
                                       JsonParser *parser,
-                                      GHashTable *seen_ids,
-                                      gboolean label_variant) {
-  if (json == NULL)
+                                      GHashTable *seen_ids) {
+  JsonArray *array = gs_modulix_json_parse_array(parser, json, "apps");
+  if (array == NULL)
     return;
 
-  g_autoptr(GError) err = NULL;
-  if (!json_parser_load_from_data(parser, json, -1, &err)) {
-    g_warning("[modulix] parse apps JSON: %s", err->message);
-    return;
-  }
-
-  JsonNode *root = json_parser_get_root(parser);
-  if (!root || !JSON_NODE_HOLDS_ARRAY(root))
-    return;
-
-  JsonArray *array = json_node_get_array(root);
   for (guint i = 0; i < json_array_get_length(array); i++) {
     JsonObject *obj = json_array_get_object_element(array, i);
-    GsApp *app =
-        gs_modulix_make_app_from_json(obj, plugin, is_installed, label_variant);
+    GsApp *app = gs_modulix_make_app_from_json(obj, plugin, is_installed);
     if (app == NULL)
       continue;
     if (seen_ids != NULL) {

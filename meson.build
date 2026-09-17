@@ -76,6 +76,10 @@ store_client_dep = declare_dependency(
 plugin_sources = files(
   'plugin/src/gs-plugin-modulix.c',
   'plugin/src/gs-modulix-app.c',
+  'plugin/src/gs-modulix-icon-theme.c',
+  'plugin/src/gs-modulix-lifecycle.c',
+  'plugin/src/gs-modulix-list.c',
+  'plugin/src/gs-modulix-refine.c',
   'plugin/src/gs-modulix-enrichment-cache.c',
   'plugin/src/gs-modulix-icon-cache.c',
   'plugin/src/gs-modulix-icon-resolver.c',

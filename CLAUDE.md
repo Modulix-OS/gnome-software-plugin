@@ -42,7 +42,8 @@ system bus, both at `/org/modulix/Daemon`) through a small Rust+C shim crate,
 
 ```
 GNOME Software (user process)
-  libgs_plugin_modulix.so   (plugin/src/gs-plugin-modulix.c, GsPlugin subclass, async vfuncs)
+  libgs_plugin_modulix.so   (GsPlugin subclass: gs-plugin-modulix.c = GObject shell,
+                             gs-modulix-{list,refine,lifecycle}.c = async vfunc bodies)
    └── mx_store_* (modulix-store-client.h, C shim over zbus)
         ├── READ  → org.modulix.Store1  → mx-daemon (unprivileged)
         └── WRITE → org.modulix.Daemon  → mx-daemon (polkit-gated)
@@ -65,7 +66,12 @@ GNOME Software (user process)
 
 | Path | Role |
 |---|---|
-| `plugin/src/gs-plugin-modulix.c` | The C plugin: vfuncs `setup`/`list_apps`/`refine`/`install_apps`/`uninstall_apps`, `gs_plugin_query_type`. |
+| `plugin/src/gs-plugin-modulix.c` | GObject shell only: type definition, `setup_async` (locale, icon theme, resolver, `mx_store_init`), vfunc plumbing, `gs_plugin_query_type`. |
+| `plugin/src/gs-modulix-list.c` | `list_apps` body: the three query shapes (search / installed / `alternate_of`), one `collect_into()` call per daemon read. |
+| `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
+| `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `mx_store_*` write calls. |
+| `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
+| `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
 | `../modulix-store-client/` | Sibling repo: Rust staticlib (`crate-type = ["staticlib","rlib"]`) wrapping zbus proxies to `org.modulix.{Store1,Daemon}` behind `extern "C"` (`mx_store_*`). No dependency on `modulix-core-utils`. |
 | `../modulix-store-client/cbindgen.toml` | Generates `modulix-store-client.h` (the FFI header) at build time. |
 | `meson.build` | One `custom_target` runs cargo (→ `libmodulix_store_client.a`) **and** cbindgen (→ `modulix-store-client.h`) against the sibling checkout; the plugin links `-lmodulix_store_client`. |
@@ -81,13 +87,12 @@ same app (one "Firefox" row) while still offering every source.
   Flatpak. The nix attribute is kept separately in `g_object_set_data
   "modulix::name"` (used for install). `bundle_kind = AS_BUNDLE_KIND_PACKAGE` +
   an icon are **mandatory** or the loader drops the app.
-- The `"<app_name> (<pname>)"` display-name label (`gs-modulix-app.c`,
-  `gs_modulix_make_app_from_json`) only appears when the caller passes
-  `label_variant = TRUE` — the installed list and the `alternate_of` (Sources
-  popover) paths. The search-results path passes `FALSE`: `dedup_by_group`
-  (`modulix-daemon/src/store/entry.rs`) has already merged the variants there, so the
-  parenthesized pname would be redundant noise next to the Flatpak row (e.g.
-  `Firefox (firefox-bin)` instead of a bare `Firefox`).
+- The display name is plain `app_name` → `pname` → `name`
+  (`gs_modulix_make_app_from_json`, `gs-modulix-app.c`). The former
+  `"<app_name> (<pname>)"` variant label (and its `label_variant` argument) is
+  gone: a GsApp is now shared across queries through the plugin cache, so the
+  label could no longer depend on which path listed it, and the Sources
+  popover distinguishes variants by its own origin/`SortKey` ordering anyway.
 - **Which entry wins the dedup** is decided by `gs_app_get_priority()`
   (`lib/gs-app.c`), which comes from the fixed point over
   `GS_PLUGIN_RULE_BETTER_THAN` edges (`gs-plugin-loader.c`) — **not** from
@@ -100,8 +105,39 @@ same app (one "Firefox" row) while still offering every source.
   `modulix::flatpak_preferred` (computed in `modulix-daemon/src/store/entry.rs`,
   written to GObject data in `gs-modulix-app.c`) is currently **inert** — no
   per-app exception is expressible.
+- **Installed state** comes from the daemon, per entry: every `a{sv}` row
+  carries an `installed` bool (`AppEntry` in `modulix-daemon/src/store/entry.rs`),
+  stamped *after* every `FlightCache` read so a 60s-old `SearchPackages` or a
+  5min-old `PackagesForAppId` never serves a pre-install answer, and
+  invalidated outright by `store::invalidate_installed()` when a write goes
+  through `org.modulix.Daemon`. `gs_modulix_make_app_from_json` reads it; the
+  `is_installed` argument is only the fallback for a daemon predating the
+  field. Before this, only the installed *listing* said `TRUE`, so search
+  results and Sources-popover rows were born `AVAILABLE` whatever the system
+  had. The flag also elects each group's representative in `dedup_by_group`
+  (an installed `firefox-bin` outranks an available `firefox`), which is why
+  the daemon stamps it *before* deduplicating.
+- **One `GsApp` per (kind, name), via `gs_plugin_cache_{lookup,add}`**
+  (`gs-modulix-app.c`) — the pattern flatpak/packagekit/epiphany use. The key
+  is `"<kind>\x1f<name>"`, **not** the GsApp id, which the `alternate_of` path
+  deliberately shares across rows. Reuse is what makes state survive a query:
+  `gs_details_page_get_alternates_cb` (`src/gs-details-page.c`) calls
+  `_set_app()` with the matching row of the `alternate-of` reply, re-issued on
+  every page reload — a fresh instance would land `AVAILABLE` and flip the
+  button back to "Install" the instant an install finished. Consequences for
+  anything written onto a `GsApp`: it must be idempotent or guarded, since the
+  same object is re-listed and re-refined. Icons (`gs_app_has_icons`),
+  screenshots (`gs_app_get_screenshots`) and module addons
+  (`modulix::addons-added` object data) are guarded; `gs_app_set_state` skips
+  the transient states owned by `enqueue_lifecycle` (`gs-modulix-lifecycle.c`) through
+  its `state_is_transient` guard (`gs-modulix-app.c`);
+  `gs_app_set_metadata` is write-once (`lib/gs-app.c` warns and returns on a
+  second write of the same key), and `gs_app_set_license` only accepts a
+  *strictly higher* quality, so the first caller wins in both. `gs_app_set_name`
+  is **not** in that group — it gates on `quality < name_quality`, so an
+  equal-quality rewrite does go through.
 - **Module beats nix package when both are ours** via emission order:
-  `list_apps_thread` (`gs-plugin-modulix.c`) appends modules before packages
+  `list_apps_thread` (`gs-modulix-list.c`) appends modules before packages
   in both the `installed` and `search` modes, sharing a `seen_ids`
   `GHashTable` passed to `gs_modulix_append_apps_from_json()` — an id already
   seen is skipped, so the module wins intra-plugin dedup explicitly instead of
@@ -218,6 +254,36 @@ Flathub-enrichment step deliberately skips adding its remote icon on top —
 otherwise the download completing later would flip the first pass back on
 and silently replace the themed icon.
 
+### Licenses
+
+The details page's License row comes from `gs_app_set_license()`, which only
+accepts a write of **strictly higher** `GsAppQuality` than the one already
+stored (`lib/gs-app.c`) — that arbitration is what orders our two sources:
+
+- **nixpkgs `meta.license`** (`GS_APP_QUALITY_HIGHEST`) — the license of the
+  derivation the user actually gets. Costs one `nix eval` per attribute
+  daemon-side (`Store1.GetPackageLicenses` → `package_info::license_for_package`),
+  so the plugin only asks for it when `require_flags` carries **ADDONS**:
+  that bit is the details page's own marker (`GS_DETAILS_PAGE_REFINE_REQUIRE_FLAGS`
+  in `src/gs-details-page.c`), and the search page — which also requests
+  `LICENSE`, over its whole result list — never sets it. `prefetch_licenses()`
+  batches the whole list into one call whose result lives in `TaskData.licenses`
+  for that job only (the daemon owns the real cache).
+- **Flathub `project_license`** (`GS_APP_QUALITY_NORMAL`) — rides along in the
+  enrichment payload already fetched for DESCRIPTION/SCREENSHOTS, so it is
+  free on every path, including search. Used for modules (no nix attribute to
+  evaluate) and whenever the `nix eval` yielded nothing.
+
+Because search runs first and details later on the *same* `GsApp`, the
+HIGHEST/NORMAL split is what lets the nix license replace the Flathub one when
+the user opens the details page, and never the other way round.
+
+`modulix-core-utils::license` (`src/core/license.rs`) normalizes both into the
+SPDX expression AppStream understands: a list of licenses joins with `AND`, a
+single unfree term collapses the whole expression to `LicenseRef-proprietary`,
+and a term with no `spdxId` degrades it to `LicenseRef-free` rather than
+emitting a partial `AND` chain.
+
 ## Contracts (must match the real services)
 
 ### D-Bus — `org.modulix.Daemon`, `org.modulix.Store1` (system bus), in `../modulix-daemon`
@@ -233,6 +299,7 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` | `ListModulePlugins` | `s` (module) | `aa{sv}` |
 | `Store1` | `GetAppEnrichment` | `as` (app_ids) | `a{sa{sv}}` |
 | `Store1` | `PackagesForAppId` | `s` (app_id) | `aa{sv}` |
+| `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |
@@ -242,22 +309,27 @@ Success = a D-Bus reply with no error. Packages/modules are batched into one
 `as` call each; plugins are called individually. `a{sv}` entry field names
 (`name`, `base_name`, `pname`, `app_name?`, `summary`, `version`, `app_id?`,
 `group_id?`, `icon?`, `icon_name?`, `kind`, `flatpak_preferred`,
-`variant_rank`, `score?`) are documented in `modulix-daemon/src/store/entry.rs`
+`variant_rank`, `score?`, `installed`) are documented in
+`modulix-daemon/src/store/entry.rs`
 and re-serialized by the shim to the same-named JSON keys this repo's C code
 parses — see `plugin/src/gs-modulix-app.c`'s `gs_modulix_make_app_from_json`
-for exactly which keys it reads.
+for exactly which keys it reads. The enrichment entry
+(`GetAppEnrichment`) carries `description?`, `screenshots?`, `icon?`,
+`icon_name?` and `license?` (SPDX expression, or an AppStream
+`LicenseRef-proprietary`/`LicenseRef-free` when only the free/unfree bit is
+known — see `modulix-core-utils::license`).
 
 ### `modulix-store-client` C ABI — `../modulix-store-client/cbindgen.toml`
 
 `mx_store_init`/`mx_store_shutdown`/`mx_store_free_string`; reads
 `mx_store_{search_packages,search_modules,list_installed_packages,
 list_installed_modules,list_module_plugins,get_app_enrichment,
-get_app_enrichment_many,packages_for_app_id}`; writes
+get_app_enrichment_many,packages_for_app_id,package_licenses}`; writes
 `mx_store_{install,uninstall}_{packages,modules}` (name array + count) and
 `mx_store_{install,uninstall}_plugin` (module, plugin). Every call returns
 `NULL` on failure (connection error, D-Bus error, denied polkit
 authorization) — this repo's code never sees *why* a write failed, only
-whether it did (see `lifecycle_execute` in `gs-plugin-modulix.c`).
+whether it did (see `lifecycle_execute` in `gs-modulix-lifecycle.c`).
 
 ## Gotchas / current limitations
 
@@ -266,6 +338,37 @@ whether it did (see `lifecycle_execute` in `gs-plugin-modulix.c`).
   package build vendors it via the `modulix-store-client` flake input
   (`git+file://…`, also picking up tracked uncommitted edits); switch that
   input to the GitHub URL once pushed.
+- **`just build` and the Nix build do not see the same files.** A
+  `git+file://` input exports only files git **tracks at HEAD** — working-tree
+  edits to tracked files are included, but a brand-new file that has never
+  been committed (staging it is not enough) is silently absent. So
+  `just build` can succeed while `nix build .#plugin` fails on a missing
+  symbol or module. Same trap one level up: an input already locked to a clean
+  `rev` is **not** re-resolved from the working tree, so a rebuild keeps
+  serving the committed version. `nix flake update --allow-dirty-locks <input>`
+  turns such an entry into a `dirtyRev` one that is re-read on every eval —
+  that is how the system ended up running a new `mx-daemon` against the old
+  plugin. Verify what actually shipped rather than assuming:
+  `strings …/plugins-23/libgs_plugin_modulix.so | grep -cx 'modulix::kind'`.
+- **The Installed page silently drops any app with a NULL description.**
+  `gs_installed_page_is_actual_app()` (`src/gs-installed-page.c`) is the only
+  gate — an app can pass `gs_plugin_loader_app_is_valid()` and
+  `filter_app_kinds_cb` and still never be rendered. Our description only ever
+  comes from Flathub enrichment, so every nix package with no Flatpak
+  counterpart (no `app_id` → `refine_one` returns before fetching) used to be
+  invisible there. `refine_one` now seeds the summary as a
+  `GS_APP_QUALITY_LOWEST` description; Flathub's own, written at `NORMAL`,
+  still replaces it. `meta.longDescription` is not an alternative — it is
+  empty for essentially every attribute we list.
+- **`just run-gs` tests nothing while GNOME Software is already running.**
+  `mx` starts it as a user service
+  (`systemd.user.services.gnome-software.wantedBy = graphical-session.target`),
+  so it owns `org.gnome.Software` on the session bus and GApplication makes
+  the dev launcher hand its arguments to that instance and exit — the local
+  `~/.local` plugin is never loaded, and the log stops right after the
+  `[dev] overlaying N plugins` banner. Run `gnome-software --quit` (or
+  `systemctl --user stop gnome-software`) first. `dbus-run-session` is not a
+  workaround: gnome-software segfaults under it inside the bubblewrap runner.
 - Sort-key suffix ranking and `FLATPAK_PREFERRED_APP_IDS` are curated (on the
   daemon side, `modulix-core-utils::package_info`) — tune against the real
   flatpak/packagekit app priorities with d-spy/bustle.
@@ -287,6 +390,13 @@ whether it did (see `lifecycle_execute` in `gs-plugin-modulix.c`).
   table without a field the code expects fails the whole daemon build, not
   just tests — this repo is unaffected either way since it no longer builds
   `modulix-core-utils` at all.
+- `Store1.GetPackageLicenses` runs one `nix eval` per uncached attribute and
+  caps a single call at `MAX_LICENSE_EVALS` (16, `modulix-daemon/src/store/mod.rs`);
+  attributes past the cap are served from cache or omitted. The plugin-side
+  guard (ADDONS-only, see "Licenses") is the one that actually keeps the
+  search page off this path — if a future GNOME Software page requests
+  `LICENSE` together with `ADDONS` over a long list, that guard needs
+  revisiting.
 - `mx_store_*` write calls collapse every failure mode (bus down, D-Bus
   error, denied polkit prompt, daemon-side transaction failure) to `NULL`;
   `lifecycle_execute` reports a single generic `GS_PLUGIN_ERROR_FAILED` for
