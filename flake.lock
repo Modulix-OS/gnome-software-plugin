@@ -21,11 +21,11 @@
     "modulix-store-client": {
       "flake": false,
       "locked": {
-        "lastModified": 1789592895,
-        "narHash": "sha256-IWw1Dp1oI+sI0RWb07EJze7GwAlAPfDIZWHeCpw1rmQ=",
+        "lastModified": 1789674130,
+        "narHash": "sha256-ua03mLytbuXz5wnPPyulG9RuC85l/HTXG/j6w/PCZZE=",
         "ref": "refs/heads/main",
-        "rev": "a9ac7727e935331a08f34dfe5b651e54082b9b11",
-        "revCount": 1,
+        "rev": "a9965b512c62a1156ed591e7c8ac6bc19b698b26",
+        "revCount": 2,
         "type": "git",
         "url": "file:///home/quentin/Programmes/Modulix-OS/modulix-store-client"
       },
