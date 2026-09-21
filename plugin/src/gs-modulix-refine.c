@@ -1,12 +1,39 @@
-/*
- * gs-modulix-refine.c — the refine vfunc: addons, icons, descriptions,
- * licenses and Flathub enrichment for the apps we manage.
+/**
+ * @file gs-modulix-refine.c
+ * @brief The `refine` vfunc body: addons, icons, descriptions, licenses and
+ * Flathub enrichment for the apps this plugin manages.
+ *
+ * Refine is GNOME Software's fill-in-the-missing-metadata pass: it runs
+ * often, always over a batch of `GsApp` rather than one app at a time (once
+ * per page load/refresh, over the whole result list), and must only fill in
+ * the metadata named by the caller's `GsPluginRefineRequireFlags` — see
+ * `MODULIX_REFINE_FLAGS_WE_HANDLE` below for exactly which bits this plugin
+ * honours; every other bit, and every app this plugin does not own, is left
+ * untouched.
  *
  * Two batched prefetches run before the per-app pass, so the per-app work is
  * pure cache reads:
- *   - enrichment (one daemon call for every distinct app-id of the list),
+ *   - enrichment: one `mx_store_get_app_enrichment_many` daemon round-trip
+ *     for every distinct app-id of the list (see prefetch_enrichment());
+ *     an app-id the daemon has no data for is simply absent from the reply,
+ *     which is not an error — the per-app step just finds no cache entry
+ *     for it,
  *   - licenses (one daemon call, details page only — it costs a `nix eval`
  *     per attribute daemon-side).
+ *
+ * All of the per-app work below (and both prefetches) run on the `GTask`
+ * worker thread spawned by gs_modulix_refine_async() — never on the
+ * GNOME Software main thread — except for the up-front
+ * `MODULIX_REFINE_FLAGS_WE_HANDLE` check, which runs synchronously on the
+ * caller's thread so a request this plugin cannot help with never pays for
+ * a thread hop.
+ *
+ * Missing metadata (no enrichment for an id, no license resolved, no icon
+ * past the generic fallback, …) is never treated as an error anywhere in
+ * this file: the corresponding `GsApp` field is simply left unset, and the
+ * refine operation still completes successfully. The only failure mode
+ * surfaced through gs_modulix_refine_finish() is cancellation
+ * (`GCancellable`) mid-batch.
  */
 
 #include "gs-modulix-refine.h"
@@ -21,6 +48,25 @@
 #include "modulix-store-client.h"
 #include <json-glib/json-glib.h>
 
+/**
+ * @brief Per-task state for one gs_modulix_refine_async() invocation,
+ * carried as the `GTask`'s task data.
+ *
+ * @var RefineData::plugin
+ *   The owning `GsPlugin`. Borrowed: the `GTask`'s source object keeps it
+ *   alive for at least the lifetime of this struct, so no reference is
+ *   taken here.
+ * @var RefineData::list
+ *   The batch of apps being refined. Owned: one reference taken in
+ *   gs_modulix_refine_async(), released by refine_data_free().
+ * @var RefineData::licenses
+ *   Owned `GHashTable` mapping nix attribute (owned `gchar *` key) to SPDX
+ *   license expression (owned `gchar *` value). NULL unless the current
+ *   refine is a details-page refine (LICENSE + ADDONS both set), in which
+ *   case it is allocated in refine_thread() and filled by
+ *   prefetch_licenses(); an attribute prefetch_licenses() found no license
+ *   for is simply absent as a key, not an error.
+ */
 typedef struct {
   GsPlugin *plugin; /* borrowed: the task's source object outlives the data */
   GsAppList *list;
@@ -30,21 +76,63 @@ typedef struct {
   GHashTable *licenses;
 } RefineData;
 
+/**
+ * @brief `GDestroyNotify` for #RefineData: releases the list reference and
+ * the licenses table, then frees the struct itself.
+ * @param d The #RefineData to free. Must not be NULL; after this call, @p d
+ *   is no longer valid.
+ * @pre @p d was allocated with `g_new0(RefineData, 1)` and installed as a
+ *   `GTask`'s task data (or is otherwise solely owned by the caller).
+ * @post @p d->list is unreffed (if non-NULL), @p d->licenses is unreffed
+ *   (if non-NULL, freeing every owned key/value it held), and @p d itself
+ *   is freed. Nothing is returned.
+ */
 static void refine_data_free(RefineData *d) {
   g_clear_object(&d->list);
   g_clear_pointer(&d->licenses, g_hash_table_unref);
   g_free(d);
 }
 
+/**
+ * @brief Reads the AppStream component id this plugin stashed on @p app.
+ * @param app The `GsApp` to inspect. Must not be NULL.
+ * @pre None beyond @p app being a valid `GsApp`; this accessor does not
+ *   check `gs_modulix_app_is_ours()` itself.
+ * @return (transfer none) (nullable): the id set as `"modulix::app_id"`
+ *   object data, or NULL when the app carries none (e.g. a nix package with
+ *   no matching Flathub/AppStream entry, or an app this plugin did not
+ *   create). The returned string is owned by @p app; the caller must not
+ *   free it and must not use it past @p app's lifetime.
+ */
 static const gchar *app_id_of(GsApp *app) {
   return g_object_get_data(G_OBJECT(app), "modulix::app_id");
 }
 
 /* ── per-app refine steps ───────────────────────────────────────────────── */
 
-/* Addons (module plugins) are only needed by the details page
+/**
+ * @brief Attaches a module's plugins as ADDON addons, honouring the ADDONS
+ * require flag only.
+ *
+ * Addons (module plugins) are only needed by the details page
  * (GS_PLUGIN_REFINE_REQUIRE_FLAGS_ADDONS); building them costs a
- * full-namespace `nix eval`, so it must never happen on the search path. */
+ * full-namespace `nix eval`, so it must never happen on the search path.
+ *
+ * @param app The app to add addons to. Must not be NULL.
+ * @param require_flags Caller's `GsPluginRefineRequireFlags`. Only
+ *   `GS_PLUGIN_REFINE_REQUIRE_FLAGS_ADDONS` is consulted; every other bit is
+ *   ignored by this function.
+ * @param plugin The owning `GsPlugin`, forwarded to
+ *   gs_modulix_add_module_plugins() for cache/ownership checks.
+ * @pre None beyond @p app, @p plugin being valid.
+ * @post No-op unless ADDONS is requested and @p app's `modulix::kind` is
+ *   `"module"` with a non-empty name; otherwise
+ *   gs_modulix_add_module_plugins() is called, which is itself guarded
+ *   against re-adding addons to an app already carrying them (see
+ *   `modulix::addons-added` in gs-modulix-app.c). Nothing is returned; a
+ *   module with no resolvable plugins list simply gets no addons, which is
+ *   not an error.
+ */
 static void refine_addons(GsApp *app, GsPluginRefineRequireFlags require_flags,
                           GsPlugin *plugin) {
   if (!(require_flags & GS_PLUGIN_REFINE_REQUIRE_FLAGS_ADDONS))
@@ -62,11 +150,32 @@ static void refine_addons(GsApp *app, GsPluginRefineRequireFlags require_flags,
           (g_get_monotonic_time() - t0) / 1000.0);
 }
 
-/* ICON refine is local-only (theme/file-cache lookups, no network): handled
+/**
+ * @brief Resolves and attaches an icon for @p app, honouring the ICON
+ * require flag only.
+ *
+ * ICON refine is local-only (theme/file-cache lookups, no network): handled
  * unconditionally here rather than folded into the DESCRIPTION/SCREENSHOTS
  * Flathub-fetch path. Only replayed when the app still has no icon at all —
  * e.g. an `alternate_of` row, whose backend entry carries `icon: None` (see
- * CLAUDE.md "Icons"). */
+ * CLAUDE.md "Icons").
+ *
+ * @param app The app to attach an icon to. Must not be NULL.
+ * @param require_flags Caller's `GsPluginRefineRequireFlags`. Only
+ *   `GS_PLUGIN_REFINE_REQUIRE_FLAGS_ICON` is consulted here.
+ * @param app_id (nullable): the app's AppStream id (as returned by
+ *   app_id_of()), forwarded to gs_modulix_icon_resolve() for its
+ *   flatpak-appstream/remote-icon-cache lookups. NULL is accepted — the
+ *   resolver falls back to its other lookup keys.
+ * @pre None beyond @p app being valid.
+ * @post No-op unless ICON is requested and @p app has no icon yet
+ *   (`gs_app_has_icons()`). Otherwise gs_modulix_icon_resolve() is called,
+ *   which always attaches exactly one `GIcon` (never zero — it falls back
+ *   to a generic icon), and on success this function additionally marks
+ *   @p app with `"modulix::icon-themed"` object data so
+ *   refine_from_enrichment() knows not to add a competing remote icon
+ *   later. Nothing is returned.
+ */
 static void refine_icon(GsApp *app, GsPluginRefineRequireFlags require_flags,
                         const gchar *app_id) {
   if (!(require_flags & GS_PLUGIN_REFINE_REQUIRE_FLAGS_ICON))
@@ -83,16 +192,37 @@ static void refine_icon(GsApp *app, GsPluginRefineRequireFlags require_flags,
     g_object_set_data(G_OBJECT(app), "modulix::icon-themed", GINT_TO_POINTER(1));
 }
 
-/* A NULL description is enough on its own to hide an app: the Installed page
- * drops every row that has none (`gs_installed_page_is_actual_app`,
+/**
+ * @brief Seeds @p app's description from its summary at
+ * `GS_APP_QUALITY_LOWEST`, so an app with no Flathub match still passes the
+ * Installed page's "has a description" gate.
+ *
+ * A NULL description is enough on its own to hide an app: the Installed
+ * page drops every row that has none (`gs_installed_page_is_actual_app`,
  * src/gs-installed-page.c). Ours only ever comes from Flathub enrichment,
  * which the early returns in refine_one() skip entirely for an app with no
  * app_id — so a nix package with no Flatpak counterpart vanished from the
  * Installed list altogether. nixpkgs has nothing better to offer either
- * (`meta.longDescription` is empty for these attributes), so seed the summary
- * at LOWEST quality: `gs_app_set_description` (lib/gs-app.c) ignores a write
- * of lower quality than the one stored, so the Flathub description set at
- * NORMAL still wins whenever there is one. */
+ * (`meta.longDescription` is empty for these attributes), so seed the
+ * summary at LOWEST quality: `gs_app_set_description` (lib/gs-app.c)
+ * ignores a write of lower quality than the one stored, so the Flathub
+ * description set at NORMAL still wins whenever there is one.
+ *
+ * @param app The app to seed a description on. Must not be NULL.
+ * @param flags Caller's `GsPluginRefineRequireFlags`. Only
+ *   `GS_PLUGIN_REFINE_REQUIRE_FLAGS_DESCRIPTION` is consulted, and only to
+ *   decide whether an already-present description may be left alone; this
+ *   function still runs (as a fallback seed) when DESCRIPTION is not
+ *   requested but @p app currently has no description at all.
+ * @pre None beyond @p app being valid.
+ * @post No-op when DESCRIPTION was requested and @p app already has a
+ *   description, or when @p app's summary is NULL/empty. Otherwise
+ *   `gs_app_set_description()` is called at `GS_APP_QUALITY_LOWEST` with
+ *   the summary, markup-escaped so a bare `&`/`<` cannot break the Pango
+ *   markup renderer. A later higher-quality write (e.g. Flathub's, at
+ *   NORMAL) still overrides this one. Nothing is returned; there is no
+ *   error case.
+ */
 static void seed_description_from_summary(GsApp *app,
                                           GsPluginRefineRequireFlags flags) {
   if (!(flags & GS_PLUGIN_REFINE_REQUIRE_FLAGS_DESCRIPTION) &&
@@ -112,12 +242,33 @@ static void seed_description_from_summary(GsApp *app,
   gs_app_set_description(app, GS_APP_QUALITY_LOWEST, escaped);
 }
 
-/* The nixpkgs `meta.license` of the attribute we would install, set at HIGHEST
- * quality because it describes the exact build the user gets, and must
- * therefore override a Flathub license a previous (search page) refine of the
- * *same* GsApp may already have set at NORMAL. @licenses is only populated on
- * the details-page refine — see prefetch_licenses(). Returns TRUE when it won,
- * i.e. when the Flathub fallback must not be applied. */
+/**
+ * @brief Applies the nixpkgs `meta.license` of the attribute @p app would
+ * install, honouring the LICENSE require flag only.
+ *
+ * Set at HIGHEST quality because it describes the exact build the user
+ * gets, and must therefore override a Flathub license a previous (search
+ * page) refine of the *same* GsApp may already have set at NORMAL.
+ * @p licenses is only populated on the details-page refine — see
+ * prefetch_licenses().
+ *
+ * @param app The app to set the license on. Must not be NULL.
+ * @param flags Caller's `GsPluginRefineRequireFlags`. Only
+ *   `GS_PLUGIN_REFINE_REQUIRE_FLAGS_LICENSE` is consulted.
+ * @param licenses (nullable): nix attribute → SPDX expression map (both
+ *   borrowed from the table's own storage), as filled by
+ *   prefetch_licenses(); NULL on a non-details-page refine, in which case
+ *   this function always returns %FALSE without touching @p app.
+ * @pre None beyond @p app being valid.
+ * @post No-op (returns %FALSE) when LICENSE was not requested, @p licenses
+ *   is NULL, @p app has no nix attribute name, or that attribute is absent
+ *   from @p licenses — the last case is not an error, just "nothing to
+ *   apply yet" (the Flathub fallback in refine_from_enrichment() covers
+ *   it). Otherwise `gs_app_set_license()` is called at
+ *   `GS_APP_QUALITY_HIGHEST`.
+ * @return %TRUE when the nix license was applied (i.e. the Flathub fallback
+ *   must not overwrite it), %FALSE otherwise.
+ */
 static gboolean refine_license_from_nix(GsApp *app,
                                         GsPluginRefineRequireFlags flags,
                                         GHashTable *licenses) {
@@ -134,8 +285,42 @@ static gboolean refine_license_from_nix(GsApp *app,
   return TRUE;
 }
 
-/* Flathub payload: description, screenshots, icon URL and the fallback
- * `project_license` (modules, and attributes `nix eval` could not resolve). */
+/**
+ * @brief Applies the Flathub enrichment payload for @p app_id: description,
+ * screenshots, icon URL and the fallback `project_license` (modules, and
+ * attributes `nix eval` could not resolve).
+ *
+ * Reads the enrichment cache rather than fetching directly, so this call
+ * costs a daemon round-trip only on the first miss of a given @p app_id —
+ * the batch's ids are normally already warmed by prefetch_enrichment()
+ * before refine_one() reaches this call. An @p app_id the daemon has no
+ * enrichment for is not an error: the cache holds
+ * #GS_MODULIX_ENRICHMENT_EMPTY for it and this function simply returns
+ * without changing @p app.
+ *
+ * @param app The app to enrich. Must not be NULL.
+ * @param app_id The AppStream component id to fetch enrichment for. Must be
+ *   non-NULL and non-empty (callers already guard this — see refine_one()).
+ * @param license_set Whether refine_license_from_nix() already set a
+ *   HIGHEST-quality license on @p app; when %TRUE, the enrichment's
+ *   `project_license` is not applied, since `gs_app_set_license()` would
+ *   reject the lower-quality write anyway and there is no need to pay for
+ *   the JSON lookup.
+ * @pre None beyond @p app, @p app_id being valid as described above.
+ * @post No-op if the cache has no data for @p app_id or the cached JSON
+ *   fails to parse. Otherwise: license is set at `GS_APP_QUALITY_NORMAL`
+ *   when present and not already @p license_set; description is set at
+ *   NORMAL (HTML converted to Pango markup) when present; icon URL, when
+ *   present, is always cached via gs_modulix_icon_cache_put() for reuse by
+ *   other instances of the same app, but a new `GsRemoteIcon` is only
+ *   built and added to @p app itself (gs_app_add_icon() takes its own
+ *   reference; the local `g_autoptr` owner still unrefs it afterwards) when
+ *   @p app has not already won a themed icon
+ *   (`"modulix::icon-themed"` object data unset) — otherwise adding it
+ *   would let a later-completing download override the themed icon.
+ *   Screenshots are added unconditionally via
+ *   gs_modulix_add_app_screenshots(). Nothing is returned.
+ */
 static void refine_from_enrichment(GsApp *app, const gchar *app_id,
                                    gboolean license_set) {
   gint64 t0 = g_get_monotonic_time();
@@ -179,8 +364,25 @@ static void refine_from_enrichment(GsApp *app, const gchar *app_id,
   gs_modulix_add_app_screenshots(app, obj);
 }
 
-/* The enrichment payload carries the fallback license too, so a LICENSE-only
- * refine still has to fetch it — unless the nixpkgs license already won. */
+/**
+ * @brief Decides whether refine_one() must call refine_from_enrichment()
+ * for the current app.
+ *
+ * The enrichment payload carries the fallback license too, so a
+ * LICENSE-only refine still has to fetch it — unless the nixpkgs license
+ * already won.
+ *
+ * @param flags Caller's `GsPluginRefineRequireFlags`. Consults DESCRIPTION,
+ *   SCREENSHOTS and LICENSE; every other bit is irrelevant to this
+ *   decision.
+ * @param license_set Whether a HIGHEST-quality nix license was already
+ *   applied by refine_license_from_nix() for this app.
+ * @pre None.
+ * @return %TRUE when DESCRIPTION or SCREENSHOTS is requested, or when
+ *   LICENSE is requested and @p license_set is %FALSE; %FALSE otherwise (no
+ *   error case — a %FALSE result simply means enrichment is skipped for
+ *   this app on this refine).
+ */
 static gboolean want_enrichment(GsPluginRefineRequireFlags flags,
                                 gboolean license_set) {
   if (flags & (GS_PLUGIN_REFINE_REQUIRE_FLAGS_DESCRIPTION |
@@ -189,6 +391,34 @@ static gboolean want_enrichment(GsPluginRefineRequireFlags flags,
   return (flags & GS_PLUGIN_REFINE_REQUIRE_FLAGS_LICENSE) && !license_set;
 }
 
+/**
+ * @brief Runs every per-app refine step for one `GsApp`, in the order that
+ * makes each later step's precondition hold (icon before enrichment's
+ * icon-themed check, license-from-nix before want_enrichment()'s license
+ * check, …).
+ *
+ * @param app The app to refine. Must not be NULL; must already be confirmed
+ *   as owned by this plugin (`gs_modulix_app_is_ours()`) by the caller —
+ *   this function does not check it itself.
+ * @param require_flags Caller's `GsPluginRefineRequireFlags`, forwarded
+ *   unchanged to every step. Only the flags each step individually
+ *   documents are honoured overall (ADDONS, ICON, DESCRIPTION, LICENSE,
+ *   SCREENSHOTS); any other bit is ignored.
+ * @param plugin The owning `GsPlugin`, forwarded to refine_addons().
+ * @param licenses (nullable): nix attribute → SPDX map from
+ *   prefetch_licenses(), forwarded to refine_license_from_nix(); NULL
+ *   outside a details-page refine.
+ * @pre None beyond @p app, @p plugin being valid.
+ * @post No-op for an app whose `modulix::kind` is `"plugin"` (addon rows
+ *   are refined through their parent, not directly). Otherwise runs addons,
+ *   icon, description-seed and license-from-nix unconditionally (each
+ *   internally gated on its own flag), then calls
+ *   refine_from_enrichment() only when want_enrichment() says so AND
+ *   @p app has a non-empty app-id — an app with no app-id (no Flathub
+ *   counterpart) never reaches the enrichment step, which is why
+ *   seed_description_from_summary() exists. Nothing is returned; every
+ *   step already treats missing data as "leave unset", not as an error.
+ */
 static void refine_one(GsApp *app, GsPluginRefineRequireFlags require_flags,
                        GsPlugin *plugin, GHashTable *licenses) {
   const gchar *app_id = app_id_of(app);
@@ -212,9 +442,34 @@ static void refine_one(GsApp *app, GsPluginRefineRequireFlags require_flags,
 
 /* ── batched prefetches ─────────────────────────────────────────────────── */
 
-/* Collects the distinct values @key_fn returns over the entries of @list we
- * manage whose kind passes @kind_filter (NULL = any non-plugin kind). The
- * returned array borrows the strings from the apps. */
+/**
+ * @brief Collects the distinct, non-empty values @p key_fn returns over the
+ * apps of @p list this plugin manages, restricted to those whose kind
+ * passes @p kind_filter.
+ *
+ * Used by both batched prefetches (prefetch_enrichment(),
+ * prefetch_licenses()) to turn a `GsAppList` into the deduplicated id/attr
+ * array their one-shot daemon calls need.
+ *
+ * @param list The apps to scan. Must not be NULL.
+ * @param plugin The owning `GsPlugin`, forwarded to
+ *   `gs_modulix_app_is_ours()` to filter out apps this plugin does not
+ *   manage.
+ * @param kind_filter (nullable): when non-NULL, only apps whose
+ *   `modulix::kind` equals this string are considered; when NULL, every
+ *   kind except `"plugin"` is considered.
+ * @param key_fn Accessor called on each surviving app to obtain the value
+ *   to collect; an app for which it returns NULL or the empty string is
+ *   skipped.
+ * @pre None beyond @p list, @p plugin, @p key_fn being valid.
+ * @post No mutation of @p list or its apps.
+ * @return (transfer container) (element-type utf8): a newly allocated
+ *   `GPtrArray` the caller must free with `g_ptr_array_unref()` (or
+ *   `g_autoptr`); its elements are `const gchar *` strings borrowed from
+ *   the apps of @p list (via @p key_fn) and from an internal deduplication
+ *   table — they are only valid as long as @p list and its apps are, and
+ *   must not be freed individually. Possibly empty, never NULL.
+ */
 static GPtrArray *collect_distinct(GsAppList *list, GsPlugin *plugin,
                                    const gchar *kind_filter,
                                    const gchar *(*key_fn)(GsApp *app)) {
@@ -242,9 +497,28 @@ static GPtrArray *collect_distinct(GsAppList *list, GsPlugin *plugin,
   return keys;
 }
 
-/* Warms the enrichment cache for every app-id of @list needing enrichment, in
- * one batched backend call, so the per-app fetches in refine_one() become
- * cache hits. */
+/**
+ * @brief Warms the enrichment cache for every distinct app-id of @p list
+ * this plugin manages, in one batched backend call.
+ *
+ * This is the batched round-trip the class-level documentation refers to:
+ * it fetches every id at once through
+ * gs_modulix_enrichment_cache_prefetch_many(), which itself makes exactly
+ * one `mx_store_get_app_enrichment_many` daemon call for the whole list, so
+ * the per-app gs_modulix_enrichment_cache_get_or_fetch() calls later in
+ * refine_from_enrichment() become cache hits (or cached
+ * #GS_MODULIX_ENRICHMENT_EMPTY misses) instead of N individual daemon
+ * round-trips.
+ *
+ * @param list The batch being refined. Must not be NULL.
+ * @param plugin The owning `GsPlugin`, forwarded to collect_distinct().
+ * @pre Intended to be called once per refine_thread() invocation, before
+ *   the per-app loop.
+ * @post No daemon call is made when @p list has no distinct app-ids to
+ *   prefetch (an empty list, or one with no app_id anywhere). Nothing is
+ *   returned; an id the daemon has no enrichment for is not an error, it is
+ *   simply cached as empty.
+ */
 static void prefetch_enrichment(GsAppList *list, GsPlugin *plugin) {
   g_autoptr(GPtrArray) ids = collect_distinct(list, plugin, NULL, app_id_of);
 
@@ -253,14 +527,33 @@ static void prefetch_enrichment(GsAppList *list, GsPlugin *plugin) {
                                               ids->len);
 }
 
-/* Fills @licenses (nix attr → SPDX, both owned) for every nix package of
- * @list we manage, in one batched daemon call.
+/**
+ * @brief Fills @p licenses (nix attr → SPDX, both owned) for every nix
+ * package of @p list this plugin manages, in one batched daemon call.
  *
- * Only ever called on a details-page refine (see refine_thread): the daemon
- * runs one `nix eval` per uncached attribute, which the search page — which
- * also asks for LICENSE, over its whole result list — must never trigger.
- * Search results keep the Flathub license from the enrichment payload.
- * Modules and module plugins have no nixpkgs attribute to evaluate. */
+ * Only ever called on a details-page refine (see refine_thread()): the
+ * daemon runs one `nix eval` per uncached attribute, which the search page
+ * — which also asks for LICENSE, over its whole result list — must never
+ * trigger. Search results keep the Flathub license from the enrichment
+ * payload instead. Modules and module plugins have no nixpkgs attribute to
+ * evaluate, so they are excluded from the `"package"` kind filter passed to
+ * collect_distinct().
+ *
+ * @param list The batch being refined. Must not be NULL.
+ * @param plugin The owning `GsPlugin`, forwarded to collect_distinct().
+ * @param licenses (transfer none): destination map, owned by the caller
+ *   (RefineData::licenses); entries are inserted with newly `g_strdup()`ed
+ *   key and value, so this function's writes are independent of the
+ *   lifetime of @p list's strings.
+ * @pre @p licenses is a valid, already-allocated `GHashTable` with
+ *   `g_free` key/value destroy functions (see refine_thread()).
+ * @post Returns early, leaving @p licenses unchanged, when @p list has no
+ *   distinct nix package attributes, or when the daemon call
+ *   (`mx_store_package_licenses`) or the JSON parse fails — both are
+ *   treated as "no licenses available", not as an error surfaced to the
+ *   caller. An attribute for which the daemon returned no license (or an
+ *   empty one) is simply omitted from @p licenses. Nothing is returned.
+ */
 static void prefetch_licenses(GsAppList *list, GsPlugin *plugin,
                               GHashTable *licenses) {
   g_autoptr(GPtrArray) attrs =
@@ -300,6 +593,25 @@ static void prefetch_licenses(GsAppList *list, GsPlugin *plugin,
    GS_PLUGIN_REFINE_REQUIRE_FLAGS_LICENSE |                                    \
    GS_PLUGIN_REFINE_REQUIRE_FLAGS_ICON)
 
+/**
+ * @brief Worker body of a refine pass: prefetches in batch, then refines each
+ *        owned app.
+ *
+ * @param task The GTask to complete. Not NULL.
+ * @param source_object Unused.
+ * @param task_data_ptr The pass's RefineData: plugin, app list, require flags
+ *   and license table. Not NULL.
+ * @param cancellable Cancellable checked before each app, or NULL.
+ * @pre Runs on a GTask worker thread, never on the main thread: it blocks on the
+ *   daemon.
+ * @post Enrichment is prefetched in a single batched round-trip when the
+ *   description or the screenshots are wanted. Licenses are prefetched only when
+ *   ADDONS is also requested, i.e. only for the details page, since each one
+ *   costs a `nix eval` on the daemon. Apps of other plugins are skipped. On
+ *   cancellation the task fails with the cancellation error and the apps already
+ *   refined keep what they got.
+ * @return None.
+ */
 static void refine_thread(GTask *task, gpointer source_object G_GNUC_UNUSED,
                           gpointer task_data_ptr, GCancellable *cancellable) {
   RefineData *data = task_data_ptr;
@@ -332,6 +644,26 @@ static void refine_thread(GTask *task, gpointer source_object G_GNUC_UNUSED,
   g_task_return_boolean(task, TRUE);
 }
 
+/**
+ * @brief Starts a refine pass over @p list.
+ *
+ * @param plugin Plugin whose apps are to be refined; also the GTask's source
+ *   object. Not NULL.
+ * @param list Apps GNOME Software wants refined; reffed for the pass and left
+ *   otherwise untouched. Not NULL.
+ * @param require_flags What the caller needs filled in.
+ * @param cancellable Cancellable of the pass, or NULL.
+ * @param callback Called on completion, or NULL.
+ * @param user_data Data passed to @p callback.
+ * @param source_tag Source tag set on the GTask.
+ * @pre Main thread, as GNOME Software's refine vfunc.
+ * @post A pass asking for none of the flags this plugin handles - an
+ *   icon-or-id-only refine from the overview page, typically - completes
+ *   successfully straight away, without a thread hop and without any daemon
+ *   call. Otherwise the work happens on a worker thread; collect the outcome
+ *   with gs_modulix_refine_finish().
+ * @return None.
+ */
 void gs_modulix_refine_async(GsPlugin *plugin, GsAppList *list,
                              GsPluginRefineRequireFlags require_flags,
                              GCancellable *cancellable,
@@ -362,6 +694,17 @@ void gs_modulix_refine_async(GsPlugin *plugin, GsAppList *list,
   g_object_unref(task);
 }
 
+/**
+ * @brief Collects the outcome of a refine pass.
+ *
+ * @param result The GAsyncResult handed to the completion callback. Not NULL.
+ * @param error Return location for the error, or NULL.
+ * @pre Called once, from the callback of gs_modulix_refine_async().
+ * @post None beyond consuming the task's result.
+ * @return TRUE when the pass ran to completion, including a pass that had
+ *   nothing to do; FALSE with @p error set when it was cancelled. Metadata that
+ *   the daemon could not supply is left unset rather than reported as an error.
+ */
 gboolean gs_modulix_refine_finish(GAsyncResult *result, GError **error) {
   return g_task_propagate_boolean(G_TASK(result), error);
 }

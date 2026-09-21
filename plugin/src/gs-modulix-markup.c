@@ -1,5 +1,6 @@
-/*
- * gs-modulix-markup.c — AppStream HTML → Pango markup converter
+/**
+ * @file gs-modulix-markup.c
+ * @brief AppStream HTML → Pango markup converter.
  *
  * Mirrors the logic of gs_appstream_format_description_text() in
  * lib/gs-appstream.c, adapted for a pre-serialised HTML string coming
@@ -14,11 +15,19 @@
 
 #include <string.h>
 
-/* ── helpers ────────────────────────────────────────────────────────────── */
-
-/* Extract the tag name starting at *pos (which points just past '<' or '</').
- * Writes at most buf_size-1 bytes into buf and NUL-terminates.
- * Returns the length written (0 on overflow or empty). */
+/**
+ * @brief Reads a tag name out of a `<...>` span.
+ *
+ * @param pos First character of the name, i.e. just past `<` or `</`.
+ * @param tag_end Position of the closing `>`, used as the hard stop.
+ * @param buf Destination buffer, NUL-terminated on return. Not NULL.
+ * @param buf_size Size of @p buf in bytes, including the terminator.
+ * @pre @p pos and @p tag_end point into the same string, with `pos <= tag_end`.
+ * @post @p buf always holds a NUL-terminated string, empty when 0 is returned.
+ * @return Number of bytes written, or 0 when the name is empty or does not fit
+ *   in @p buf — the caller treats both as "not a tag I handle". Reading stops
+ *   at a space, a tab or a `/`, so attributes are left out of the name.
+ */
 static gsize extract_tag_name(const gchar *pos, const gchar *tag_end,
                               gchar *buf, gsize buf_size) {
   gsize n = 0;
@@ -31,17 +40,30 @@ static gsize extract_tag_name(const gchar *pos, const gchar *tag_end,
   return n;
 }
 
-/* ── inline formatter (recursive, mirrors gs_appstream_format_description_text)
+/**
+ * @brief Converts the inline content of one block element into Pango markup.
  *
- * Appends the Pango-markup representation of the inline content beginning at
- * **p to `out`.  Stops (and advances *p past the closing tag) when it
- * encounters </tag_name>.  Unknown inline tags have their content emitted
- * verbatim (no wrapper markup). */
+ * Recursive; mirrors gs_appstream_format_description_text(). Known inline
+ * tags (`<em>`/`<i>`, `<strong>`/`<b>`, `<code>`) are wrapped in their Pango
+ * equivalent; any other tag has its content emitted verbatim, with no
+ * wrapper markup, so an unrecognized tag never loses its text.
+ *
+ * @param out Buffer the markup is appended to. Not NULL. Mutated.
+ * @param p Cursor into the HTML, advanced as the content is consumed and left
+ *   just past the closing `</tag_name>`. Not NULL.
+ * @param tag_name Name of the enclosing element, which tells the recursion
+ *   which closing tag ends its own content.
+ * @pre `*p` points at inline content, i.e. just past the opening tag of
+ *   @p tag_name.
+ * @post @p out has gained the converted markup and `*p` has advanced; on
+ *   truncated input the cursor stops at the NUL, which the caller treats as
+ *   end of input rather than an error.
+ * @return None.
+ */
 static void format_inline(GString *out, const gchar **p,
                           const gchar *tag_name) {
   while (**p) {
     if (**p != '<') {
-      /* Plain text: escape for Pango. */
       switch (**p) {
       case '&':
         g_string_append(out, "&amp;");
@@ -80,14 +102,12 @@ static void format_inline(GString *out, const gchar **p,
     if (tlen == 0)
       continue;
 
-    /* Our own closing tag → return to caller. */
     if (closing && g_ascii_strcasecmp(tbuf, tag_name) == 0)
       return;
 
     if (closing)
-      continue; /* stray closing tag, ignore */
+      continue;
 
-    /* Known inline wrappers. */
     if (g_ascii_strcasecmp(tbuf, "em") == 0 ||
         g_ascii_strcasecmp(tbuf, "i") == 0) {
       g_string_append(out, "<i>");
@@ -103,23 +123,29 @@ static void format_inline(GString *out, const gchar **p,
       format_inline(out, p, tbuf);
       g_string_append(out, "</tt>");
     } else {
-      /* Unknown tag: consume its content without any wrapper. */
       format_inline(out, p, tbuf);
     }
   }
 }
 
-/* ── public API ─────────────────────────────────────────────────────────── */
-
 /**
- * gs_modulix_html_to_pango:
- * @html: (nullable): an AppStream HTML description string
+ * @brief Converts a subset of AppStream HTML to Pango markup suitable for
+ *        gs_app_set_description().
  *
- * Converts a subset of AppStream HTML to Pango markup suitable for passing
- * to gs_app_set_description().
+ * Supported block tags: `<p>`, `<ul>`, `<ol>`, `<li>`; supported inline tags:
+ * `<em>`/`<i>`, `<strong>`/`<b>`, `<code>` (see format_inline()). Top-level
+ * text outside a block element — not inside `<p>` or `<li>` — is dropped, since
+ * AppStream descriptions are expected to keep all of their text inside a block
+ * tag. An ordered list is rendered as `1. `, `2. `, … and an unordered one with
+ * a bullet, since Pango markup has no list construct of its own.
  *
- * Returns: (transfer full): a newly allocated Pango markup string,
- *   or an empty string if @html is %NULL or empty.
+ * @param html An AppStream HTML description string, or NULL.
+ * @pre None: malformed or truncated markup is tolerated, never rejected.
+ * @post No global state is touched.
+ * @return A newly allocated Pango markup string, stripped of leading and
+ *   trailing whitespace (transfer-full: free with g_free()). An empty string
+ *   when @p html is NULL or empty — never NULL. `&` and `<` in text are
+ *   escaped, so a description cannot inject markup of its own.
  */
 gchar *gs_modulix_html_to_pango(const gchar *html) {
   if (html == NULL || *html == '\0')
@@ -133,8 +159,6 @@ gchar *gs_modulix_html_to_pango(const gchar *html) {
 
   while (*p) {
     if (*p != '<') {
-      /* Top-level text outside block elements: skip (AppStream
-       * descriptions must live inside <p> or <li>). */
       p++;
       continue;
     }
@@ -155,14 +179,12 @@ gchar *gs_modulix_html_to_pango(const gchar *html) {
     if (tlen == 0)
       continue;
 
-    /* ── <p> ── */
     if (g_ascii_strcasecmp(tbuf, "p") == 0 && !closing) {
       if (out->len > 0)
         g_string_append_c(out, '\n');
       format_inline(out, &p, "p");
     }
 
-    /* ── <ul> / <ol> ── */
     else if (g_ascii_strcasecmp(tbuf, "ul") == 0 ||
              g_ascii_strcasecmp(tbuf, "ol") == 0) {
       if (!closing) {
@@ -174,14 +196,13 @@ gchar *gs_modulix_html_to_pango(const gchar *html) {
       }
     }
 
-    /* ── <li> ── */
     else if (g_ascii_strcasecmp(tbuf, "li") == 0 && !closing && in_list) {
       if (out->len > 0)
         g_string_append_c(out, '\n');
       if (ordered)
         g_string_append_printf(out, "%u. ", ++list_counter);
       else
-        g_string_append(out, "\xe2\x80\xa2 "); /* U+2022 BULLET */
+        g_string_append(out, "\xe2\x80\xa2 ");
       format_inline(out, &p, "li");
     }
   }

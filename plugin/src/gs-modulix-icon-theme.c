@@ -1,5 +1,6 @@
-/*
- * gs-modulix-icon-theme.c — GtkIconTheme search-path setup
+/**
+ * @file gs-modulix-icon-theme.c
+ * @brief GtkIconTheme search-path setup.
  *
  * Split out of the plugin's setup vfunc: this is one-shot process-wide
  * configuration, not plugin logic. gs-modulix-icon-resolver.c consumes its
@@ -10,11 +11,24 @@
 
 #include <gtk/gtk.h>
 
-/* Directories Papirus / Modulix-OS actually live in on a NixOS system-profile
- * install, in addition to XDG's own. `~/.nix-profile` resolves elsewhere and
- * carries no `icons/` — without /etc/profiles/per-user, outside a full GNOME
- * session the theme index built by gs-modulix-icon-resolver.c stays empty and
- * every icon falls straight through to level 2+. */
+/**
+ * @brief Lists the directories worth adding to the icon theme's search path.
+ *
+ * Includes the directories Papirus/Modulix-OS actually live in on a NixOS
+ * system-profile install, in addition to XDG's own: `~/.nix-profile`
+ * resolves elsewhere and carries no `icons/` directory, so without
+ * `/etc/profiles/per-user` — e.g. outside a full GNOME session — the
+ * theme-name index gs-modulix-icon-resolver.c builds stays empty and every
+ * icon falls straight through to resolver level 2+.
+ *
+ * @pre None.
+ * @post Nothing is created or checked on disk here — existence is tested by the
+ *   caller.
+ * @return A GPtrArray of newly allocated paths (transfer-full: free with
+ *   g_ptr_array_unref(), which frees the strings too). Order matters, since it
+ *   becomes the lookup order: the system profile first, then the user's nix
+ *   profile and per-user profile, then XDG's own system and user data dirs.
+ */
 static GPtrArray *candidate_icon_dirs(void) {
   GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
 
@@ -31,6 +45,21 @@ static GPtrArray *candidate_icon_dirs(void) {
   return dirs;
 }
 
+/**
+ * @brief Implements the setup described in the header: see
+ *        gs_modulix_icon_theme_setup() there for the contract.
+ *
+ * Builds the full new search path in memory and installs it with a single
+ * gtk_icon_theme_set_search_path() call rather than one
+ * gtk_icon_theme_add_search_path() call per candidate directory: each
+ * add_search_path call invalidates the theme and re-resolves every
+ * already-loaded icon, so N calls would mean N redundant re-resolutions.
+ *
+ * @pre Main thread, once, before gs_modulix_icon_resolver_init().
+ * @post The existing search path is preserved and the candidate directories
+ *   that exist are appended to it; the plugin's resource path is registered.
+ * @return None.
+ */
 void gs_modulix_icon_theme_setup(void) {
   GdkDisplay *display = gdk_display_get_default();
   if (display == NULL)
@@ -44,9 +73,6 @@ void gs_modulix_icon_theme_setup(void) {
 
   g_autoptr(GPtrArray) icon_dirs = candidate_icon_dirs();
 
-  /* A single gtk_icon_theme_set_search_path() call instead of N
-   * gtk_icon_theme_add_search_path() calls: each add invalidates the theme
-   * and re-resolves every already-loaded icon. */
   g_auto(GStrv) existing = gtk_icon_theme_get_search_path(icon_theme);
   g_autoptr(GPtrArray) new_paths = g_ptr_array_new_with_free_func(g_free);
 
