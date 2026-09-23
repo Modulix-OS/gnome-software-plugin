@@ -4,26 +4,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    modulix-store-client = {
-      url = "github:Modulix-OS/modulix-store-client";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, modulix-store-client }:
+  outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
-
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
-        };
+        pkgs = import nixpkgs { inherit system; };
 
         # gnome-software patched with an explicit "GnomeSoftware::SortKey" metadata
         # sort key, read *before* the packaging-format-preference GSetting in the
@@ -39,19 +25,10 @@
           version = "0.1.0";
           src = ./.;
 
-          cargoDeps = pkgs.rustPlatform.importCargoLock {
-            lockFile = "${modulix-store-client}/Cargo.lock";
-          };
-          cargoRoot = "../modulix-store-client";
-
           nativeBuildInputs = [
             pkgs.meson
             pkgs.ninja
             pkgs.pkg-config
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.rustPlatform.cargoSetupHook
-            pkgs.rust-cbindgen
             pkgs.gettext # msgfmt: compile po/*.po → *.mo
             pkgs.glib # glib-compile-resources: embed the badge icon
           ];
@@ -62,17 +39,9 @@
             pkgs.gtk4
             pkgs.libadwaita
             pkgs.appstream
-            pkgs.json-glib
             pkgs.libsoup_3
             pkgs.libxmlb
           ];
-
-          postUnpack = ''
-            cp -r --no-preserve=mode,ownership \
-              ${modulix-store-client} "$NIX_BUILD_TOP/modulix-store-client"
-          '';
-
-          env.CARGO_NET_OFFLINE = "true";
 
           meta = {
             description = "GNOME Software plugin to browse/install Modulix nix packages and modules";
@@ -146,13 +115,9 @@
             pkgs.gtk4 pkgs.gtk4.dev
             pkgs.libadwaita pkgs.libadwaita.dev
             pkgs.appstream pkgs.appstream.dev
-            pkgs.json-glib pkgs.json-glib.dev
             pkgs.libsoup_3 pkgs.libsoup_3.dev
             pkgs.libxmlb pkgs.libxmlb.dev
-            pkgs.openssl pkgs.openssl.dev pkgs.zlib
 
-            rustToolchain
-            pkgs.rust-cbindgen
             pkgs.just pkgs.jq pkgs.git
             pkgs.d-spy pkgs.bustle pkgs.gdb
             gnome-software-dev

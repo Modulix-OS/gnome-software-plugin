@@ -1,31 +1,28 @@
 /**
  * @file gs-modulix-app.c
- * @brief GsApp construction from Modulix JSON payloads.
+ * @brief GsApp construction from Modulix `a{sv}` payloads.
  *
- * Turns the JSON entries emitted by the `modulix-store-client` C ABI shim
- * (`mx_store_*`, itself a reshaping of the `a{sv}` rows
- * `org.modulix.Store1` returns — see `AppEntry`/`PluginEntry`/`EnrichEntry`
- * in `modulix-daemon/src/store/entry.rs` and `dict_to_json`/`shots_to_json`
- * in `modulix-store-client/src/convert.rs` for the exact wire contract)
- * into `GsApp` objects GNOME Software can list, refine, install and
- * uninstall.
+ * Turns the `a{sv}` dicts `org.modulix.Store1` returns (read via
+ * `plugin/src/dbus/gs-modulix-store1.c`) into `GsApp` objects GNOME Software
+ * can list, refine, install and uninstall — see `AppEntry`/`PluginEntry`/
+ * `EnrichEntry` in `modulix-daemon/src/store/entry.rs` for the field-by-field
+ * wire contract this file reads against.
  *
  * Covers:
- *   - gs_modulix_make_app_from_json()       : single JSON object → GsApp
- *   - gs_modulix_append_apps_from_json()    : JSON array → GsAppList
- *   - gs_modulix_add_module_plugins()       : attach ADDON plugins to a module
- *   - gs_modulix_add_app_screenshots()      : attach AsScreenshot objects
+ *   - gs_modulix_make_app_from_variant()       : single dict → GsApp
+ *   - gs_modulix_append_apps_from_variant()     : aa{sv} → GsAppList
+ *   - gs_modulix_add_module_plugins()           : attach ADDON plugins
+ *   - gs_modulix_add_app_screenshots()          : attach AsScreenshot objects
  *
  * See CLAUDE.md ("GsApp mapping & dedup") for the design rationale behind
  * the SortKey / match-value / priority scheme in this file, and for how a
  * Modulix `GsApp` deduplicates against the Flatpak of the same app.
  *
- * The daemon (`modulix-daemon/src/store/entry.rs`) only emits neutral fields
- * (`kind`, `variant_rank`, `score`) — no GNOME-Software-specific number
- * crosses the bus. This is the one place that turns them into the two GNOME
- * Software conventions: `GnomeSoftware::SortKey` metadata (orders the
- * details-page "Sources" popover) and `GsApp::match-value` (orders the
- * search-results page).
+ * The daemon only emits neutral fields (`kind`, `variant_rank`, `score`) —
+ * no GNOME-Software-specific number crosses the bus. This is the one place
+ * that turns them into the two GNOME Software conventions:
+ * `GnomeSoftware::SortKey` metadata (orders the details-page "Sources"
+ * popover) and `GsApp::match-value` (orders the search-results page).
  */
 
 #ifndef I_KNOW_THE_GNOME_SOFTWARE_API_IS_SUBJECT_TO_CHANGE
@@ -35,7 +32,6 @@
 #include "gs-modulix-app.h"
 #include "gs-modulix-icon-cache.h"
 #include "gs-modulix-icon-resolver.h"
-#include "gs-modulix-json-utils.h"
 #include "gs-modulix-plugins-cache.h"
 
 #include <glib/gi18n-lib.h>
@@ -51,7 +47,7 @@
  *
  * Consumed as the literal value written under `"GnomeSoftware::SortKey"`
  * for every entry whose `kind` is `"module"` (see
- * gs_modulix_make_app_from_json()).
+ * gs_modulix_make_app_from_variant()).
  */
 #define MODULIX_MODULE_SORT_KEY 50
 
@@ -61,9 +57,9 @@
  *
  * The final SortKey for a non-module entry is
  * `MODULIX_PACKAGE_SORT_BASE + variant_rank` (see
- * gs_modulix_make_app_from_json()); `variant_rank` itself is computed
+ * gs_modulix_make_app_from_variant()); `variant_rank` itself is computed
  * daemon-side (`variant_rank()` in `modulix-daemon/src/store/entry.rs`) and
- * carried verbatim in the JSON `"variant_rank"` key.
+ * carried verbatim under the `"variant_rank"` key.
  */
 #define MODULIX_PACKAGE_SORT_BASE 2000
 
@@ -95,7 +91,7 @@ void gs_app_set_priority(GsApp *app, guint priority);
  *        same-id Flatpak (priority 1) and a bare nix package (the 0
  *        sentinel).
  *
- * Passed to gs_app_set_priority() in gs_modulix_make_app_from_json() for
+ * Passed to gs_app_set_priority() in gs_modulix_make_app_from_variant() for
  * every entry whose `kind` is `"module"`.
  */
 #define MODULIX_PRIORITY_MODULE 2
@@ -146,13 +142,13 @@ void gs_app_set_priority(GsApp *app, guint priority);
  * 1..=0x7F; modules get 0x80 added on top so they always precede a
  * package/Flatpak of equal relevance.
  *
- * Only called by gs_modulix_make_app_from_json() when the JSON entry's
+ * Only called by gs_modulix_make_app_from_variant() when the entry's
  * `"score"` key is present (the daemon omits it entirely outside search
  * paths, see `AppEntry::score` in `modulix-daemon/src/store/entry.rs`).
  *
- * @param score Raw relevance value from the JSON entry's `"score"` key,
- *   expected in `0..=MODULIX_MATCH_EXACT_SCORE` but not required to be:
- *   values above the ceiling are clamped, not rejected.
+ * @param score Raw relevance value from the entry's `"score"` key, expected
+ *   in `0..=MODULIX_MATCH_EXACT_SCORE` but not required to be: values above
+ *   the ceiling are clamped, not rejected.
  * @param is_module TRUE when the entry's `"kind"` is `"module"`.
  * @pre None.
  * @post None (pure function).
@@ -161,45 +157,38 @@ void gs_app_set_priority(GsApp *app, guint priority);
  *   module. Never `0`, so a Modulix entry never sorts as "no relevance" in
  *   the search page.
  */
-static guint modulix_match_value(gint score, gboolean is_module) {
-  gint capped = MIN(score, MODULIX_MATCH_EXACT_SCORE);
-  guint scaled =
-      MAX(1u, (guint)((capped * MODULIX_MATCH_SCALE_MAX) / MODULIX_MATCH_EXACT_SCORE));
+static guint modulix_match_value(guint score, gboolean is_module) {
+  guint capped = MIN(score, (guint)MODULIX_MATCH_EXACT_SCORE);
+  guint scaled = MAX(
+      1u, (capped * MODULIX_MATCH_SCALE_MAX) / MODULIX_MATCH_EXACT_SCORE);
   return is_module ? MODULIX_MATCH_MODULE_BONUS + scaled : scaled;
 }
 
 /**
- * @brief Parses `meta`'s `"screenshots"` array and attaches AsScreenshot
+ * @brief Reads `meta`'s `"screenshots"` array and attaches AsScreenshot
  *        objects to @p app.
  *
- * Expects the shape produced by `shots_to_json()`
- * (`modulix-store-client/src/convert.rs`) from the daemon's
- * `EnrichEntry::screenshots` (`ShotTuple` array,
- * `modulix-daemon/src/store/entry.rs`):
- * `"screenshots": [{"caption": string, "default": bool,
- * "images": [{"url": string, "width": uint, "height": uint}]}]`.
+ * Expects the shape carried by `EnrichEntry::screenshots`
+ * (`modulix-daemon/src/store/entry.rs`, D-Bus signature `a(sba(suu))`):
+ * one `(caption, is_default, images)` tuple per screenshot, `images` a
+ * `(url, width, height)` tuple array.
  *
  * Per-element handling:
- *   - `meta` missing the `"screenshots"` key, or that key holding a
- *     non-array value: the function returns without adding anything.
- *   - A screenshot object: `"caption"` read via gs_modulix_json_str()
- *     (`""` when absent/wrong-typed — an empty/absent caption is simply
- *     not passed to as_screenshot_set_caption()); `"default"` read via
- *     gs_modulix_json_bool() (`FALSE` when absent/wrong-typed), selecting
- *     `AS_SCREENSHOT_KIND_DEFAULT` vs `AS_SCREENSHOT_KIND_EXTRA`.
- *   - A screenshot missing `"images"`, or whose `"images"` is not an
- *     array, or is an empty array: the whole screenshot is skipped (no
- *     AsScreenshot is created for it) — an AsScreenshot with zero images
- *     would not be useful to GNOME Software.
- *   - Within `"images"`: an image whose `"url"` is absent/empty
- *     (gs_modulix_json_str() returning `""`) is skipped; `"width"`/
- *     `"height"` are read via gs_modulix_json_int() (`0` when
- *     absent/wrong-typed) and stamped verbatim, so a real screenshot with
- *     unknown dimensions ends up with an AsImage advertising 0x0.
+ *   - `meta` missing the `"screenshots"` key, or that key holding a value
+ *     of the wrong type: the function returns without adding anything.
+ *   - A screenshot tuple: `caption` (`""` when the source had none) is
+ *     passed to as_screenshot_set_caption() only when non-empty;
+ *     `is_default` selects `AS_SCREENSHOT_KIND_DEFAULT` vs
+ *     `AS_SCREENSHOT_KIND_EXTRA`.
+ *   - A screenshot whose `images` array is empty is skipped entirely — an
+ *     AsScreenshot with zero images would not be useful to GNOME Software.
+ *   - Within `images`: an image whose `url` is empty is skipped; `width`/
+ *     `height` are stamped verbatim, so a real screenshot with unknown
+ *     dimensions ends up with an AsImage advertising 0x0.
  *
  * @param app GsApp to attach screenshots to. Not NULL.
- * @param meta JsonObject read for its `"screenshots"` member (an
- *   enrichment payload — see `EnrichEntry` above). Not NULL. Read-only.
+ * @param meta `a{sv}` GVariant read for its `"screenshots"` member (an
+ *   enrichment payload). Not NULL. Read-only, borrowed.
  * @pre None.
  * @post Unchanged if @p app already had at least one screenshot (see
  *   below), or if `"screenshots"` is absent/malformed. Otherwise @p app
@@ -210,36 +199,30 @@ static guint modulix_match_value(gint score, gboolean is_module) {
  * @return None.
  *
  * A GsApp now outlives the query that produced it (see the plugin cache in
- * gs_modulix_make_app_from_json), so refine can run on one that already has
- * its screenshots — appending would show each of them twice. This function
- * guards against that by returning immediately when
+ * gs_modulix_make_app_from_variant), so refine can run on one that already
+ * has its screenshots — appending would show each of them twice. This
+ * function guards against that by returning immediately when
  * gs_app_get_screenshots() is already non-empty, so a second call on the
  * same (possibly differently-populated) `meta` is silently a no-op rather
  * than refreshing the screenshot set.
  */
-void gs_modulix_add_app_screenshots(GsApp *app, JsonObject *meta) {
+void gs_modulix_add_app_screenshots(GsApp *app, GVariant *meta) {
   GPtrArray *existing = gs_app_get_screenshots(app);
   if (existing != NULL && existing->len > 0)
     return;
-  if (!json_object_has_member(meta, "screenshots"))
-    return;
-  JsonNode *node = json_object_get_member(meta, "screenshots");
-  if (!JSON_NODE_HOLDS_ARRAY(node))
+
+  g_autoptr(GVariant) shots = NULL;
+  if (!g_variant_lookup(meta, "screenshots", "@a(sba(suu))", &shots))
     return;
 
-  JsonArray *shots = json_node_get_array(node);
-  for (guint i = 0; i < json_array_get_length(shots); i++) {
-    JsonObject *shot = json_array_get_object_element(shots, i);
-    const gchar *caption = gs_modulix_json_str(shot, "caption");
-    gboolean is_default = gs_modulix_json_bool(shot, "default");
-
-    if (!json_object_has_member(shot, "images"))
-      continue;
-    JsonNode *imgs_node = json_object_get_member(shot, "images");
-    if (!JSON_NODE_HOLDS_ARRAY(imgs_node))
-      continue;
-    JsonArray *imgs = json_node_get_array(imgs_node);
-    if (json_array_get_length(imgs) == 0)
+  GVariantIter iter;
+  g_variant_iter_init(&iter, shots);
+  const gchar *caption;
+  gboolean is_default;
+  GVariant *imgs; /* borrowed for this iteration, managed by iter_loop */
+  while (g_variant_iter_loop(&iter, "(&sb@a(suu))", &caption, &is_default,
+                             &imgs)) {
+    if (g_variant_n_children(imgs) == 0)
       continue;
 
     g_autoptr(AsScreenshot) ss = as_screenshot_new();
@@ -248,16 +231,18 @@ void gs_modulix_add_app_screenshots(GsApp *app, JsonObject *meta) {
     if (caption && *caption)
       as_screenshot_set_caption(ss, caption, NULL);
 
-    for (guint j = 0; j < json_array_get_length(imgs); j++) {
-      JsonObject *img = json_array_get_object_element(imgs, j);
-      const gchar *url = gs_modulix_json_str(img, "url");
+    GVariantIter img_iter;
+    g_variant_iter_init(&img_iter, imgs);
+    const gchar *url;
+    guint32 width, height;
+    while (g_variant_iter_loop(&img_iter, "(&suu)", &url, &width, &height)) {
       if (!url || !*url)
         continue;
       g_autoptr(AsImage) image = as_image_new();
       as_image_set_kind(image, AS_IMAGE_KIND_SOURCE);
       as_image_set_url(image, url);
-      as_image_set_width(image, (guint)gs_modulix_json_int(img, "width"));
-      as_image_set_height(image, (guint)gs_modulix_json_int(img, "height"));
+      as_image_set_width(image, width);
+      as_image_set_height(image, height);
       as_screenshot_add_image(ss, image);
     }
     gs_app_add_screenshot(app, ss);
@@ -274,7 +259,7 @@ void gs_modulix_add_app_screenshots(GsApp *app, JsonObject *meta) {
  * the user's eyes. Forcing the claimed size to 128x128 up front keeps the
  * first pass honest about what will actually be downloaded.
  *
- * Called from gs_modulix_make_app_from_json() (icon-resolver level 4,
+ * Called from gs_modulix_make_app_from_variant() (icon-resolver level 4,
  * `gs-modulix-icon-resolver.c`) and from the Flathub-enrichment step in
  * refine (`gs-modulix-refine.c`) for the remote-icon fallback level.
  *
@@ -302,10 +287,11 @@ GIcon *gs_modulix_remote_icon_new(const gchar *url) {
  * resolves them later). A listing that happens to run in between must not
  * stamp the daemon's — necessarily pre-operation — state over them.
  *
- * Used as a guard by gs_modulix_make_app_from_json() and
- * gs_modulix_add_module_plugins() before calling gs_app_set_state(): the
- * daemon-derived `installed` state is applied only when this returns FALSE
- * for the app's *current* state.
+ * Used as a guard by gs_modulix_make_app_from_variant(),
+ * gs_modulix_make_plugin_app_from_variant() and gs-modulix-refine.c's
+ * refine_plugin() before calling gs_app_set_state(): the daemon-derived
+ * `installed` state is applied only when this returns FALSE for the app's
+ * *current* state.
  *
  * @param state GsAppState to classify.
  * @pre None.
@@ -314,7 +300,7 @@ GIcon *gs_modulix_remote_icon_new(const gchar *url) {
  *   GS_APP_STATE_QUEUED_FOR_INSTALL, GS_APP_STATE_PURCHASING or
  *   GS_APP_STATE_DOWNLOADING; FALSE for every other state.
  */
-static gboolean state_is_transient(GsAppState state) {
+gboolean gs_modulix_state_is_transient(GsAppState state) {
   switch (state) {
   case GS_APP_STATE_INSTALLING:
   case GS_APP_STATE_REMOVING:
@@ -328,62 +314,61 @@ static gboolean state_is_transient(GsAppState state) {
 }
 
 /**
- * @brief Builds (or refreshes, if cached) the GsApp for one Modulix JSON app
- *        entry.
+ * @brief Builds (or refreshes, if cached) the GsApp for one Modulix `a{sv}`
+ *        app entry.
  *
- * This is the single place that maps a Modulix JSON app entry — one element
- * of the daemon's `AppEntry::into_dict()` output re-encoded to JSON by
- * `dict_to_json()` — onto a `GsApp`. JSON keys read from @p obj, all via
- * gs_modulix_json_str()/gs_modulix_json_bool()/gs_modulix_json_int()
- * (each returns `""`/`FALSE`/`0` respectively for a missing or
- * wrong-JSON-type key — see `gs-modulix-json-utils.c` — so every read below
- * degrades gracefully rather than crashing on an unexpected shape):
+ * This is the single place that maps one `a{sv}` row of
+ * `AppEntry::into_dict()` (`modulix-daemon/src/store/entry.rs`) onto a
+ * `GsApp`. Every key below is read with `g_variant_lookup(dict, key, fmt,
+ * &out)`, which leaves `out` at its initialised default (`NULL`/`FALSE`/`0`)
+ * when the key is missing or holds a value of a different type — so every
+ * read below degrades gracefully rather than crashing on an unexpected
+ * shape:
  *
- *   - `"name"` — required; gs_modulix_json_str() default of `""` for a
- *     missing/empty value makes the `!name || !*name` check below always
- *     take the empty-string branch (never a real NULL) — @b required: the
- *     function returns NULL (drops the row) when this is empty.
- *   - `"base_name"` — falls back to `name` when empty.
- *   - `"pname"`, `"app_name"` — feed the display-name choice
+ *   - `"name"` (`&s`) — required: the function returns NULL (drops the row)
+ *     when this is missing or empty.
+ *   - `"base_name"` (`&s`) — falls back to `name` when empty.
+ *   - `"pname"`, `"app_name"` (`&s`) — feed the display-name choice
  *     (`app_name` > `pname` > `name`).
- *   - `"summary"` — passed to gs_app_set_summary() verbatim (possibly
- *     empty).
- *   - `"version"` — passed to gs_app_set_version() only when non-empty;
- *     otherwise the app's version is left as whatever it already was
- *     (relevant for a cache hit).
- *   - `"app_id"` — the AppStream id, used as an icon-cache key, an
+ *   - `"summary"` (`&s`) — passed to gs_app_set_summary() verbatim
+ *     (possibly empty).
+ *   - `"version"` (`&s`) — passed to gs_app_set_version() only when
+ *     non-empty; otherwise the app's version is left as whatever it already
+ *     was (relevant for a cache hit).
+ *   - `"app_id"` (`&s`) — the AppStream id, used as an icon-cache key, an
  *     `app_unique_id` fallback, and stored as `"modulix::app_id"` object
  *     data when non-empty.
- *   - `"group_id"` — preferred `app_unique_id` (falls back to `app_id`,
- *     then `name`) — this is the *GsApp id* (`gs_app_new(app_unique_id)`),
- *     the loader's own dedup key against Flatpak/AppStream.
- *   - `"icon"` — raw icon URL/path; combined with the cross-instance icon
- *     cache (`gs-modulix-icon-cache.h`) keyed by `app_id` so an
+ *   - `"group_id"` (`&s`) — preferred `app_unique_id` (falls back to
+ *     `app_id`, then `name`) — this is the *GsApp id*
+ *     (`gs_app_new(app_unique_id)`), the loader's own dedup key against
+ *     Flatpak/AppStream.
+ *   - `"icon"` (`&s`) — raw icon URL/path; combined with the cross-instance
+ *     icon cache (`gs-modulix-icon-cache.h`) keyed by `app_id` so an
  *     `alternate_of` row carrying no icon of its own can still reuse one
  *     seen earlier for the same `app_id`.
- *   - `"icon_name"` — themed icon name candidate, forwarded to the
+ *   - `"icon_name"` (`&s`) — themed icon name candidate, forwarded to the
  *     resolver and stored as `"modulix::icon_name"` object data when
  *     non-empty.
- *   - `"kind"` — `"module"` vs anything else (treated as `"package"`);
- *     drives every module-vs-package branch below (priority, SortKey,
- *     origin, PackagingFormat/-Icon/-BaseCssColor metadata, match-value
- *     bonus) and is stored verbatim (or as literal `"package"` when
- *     empty) as `"modulix::kind"` object data.
- *   - `"flatpak_preferred"` — stored as `"modulix::flatpak_preferred"`
- *     object data only when TRUE; per CLAUDE.md ("GsApp mapping & dedup")
- *     this flag is currently inert — nothing reads it back to suppress a
- *     module's priority bump.
- *   - `"variant_rank"` — folded into the SortKey of a non-module entry
- *     (`MODULIX_PACKAGE_SORT_BASE + variant_rank`); ignored for a module
- *     (which always gets `MODULIX_MODULE_SORT_KEY`).
- *   - `"score"` — presence-checked with json_object_has_member()
- *     (`has_score`), *not* read through gs_modulix_json_int() unconditionally:
- *     the daemon omits this key entirely outside search paths (see
- *     `AppEntry::into_dict`), and an absent key must leave match-value
- *     untouched rather than force it to `0`. gs_app_set_match_value() is
- *     only called when `has_score` is TRUE, via modulix_match_value().
- *   - `"installed"` — presence-checked the same way; when present, its
- *     boolean value is authoritative and @p is_installed is ignored; when
+ *   - `"kind"` (`&s`) — `"module"` vs anything else (treated as
+ *     `"package"`); drives every module-vs-package branch below (priority,
+ *     SortKey, origin, PackagingFormat/-Icon/-BaseCssColor metadata,
+ *     match-value bonus) and is stored verbatim (or as literal `"package"`
+ *     when empty) as `"modulix::kind"` object data.
+ *   - `"flatpak_preferred"` (`b`) — stored as
+ *     `"modulix::flatpak_preferred"` object data only when TRUE; per
+ *     CLAUDE.md ("GsApp mapping & dedup") this flag is currently inert —
+ *     nothing reads it back to suppress a module's priority bump.
+ *   - `"variant_rank"` (`i`) — folded into the SortKey of a non-module
+ *     entry (`MODULIX_PACKAGE_SORT_BASE + variant_rank`); ignored for a
+ *     module (which always gets `MODULIX_MODULE_SORT_KEY`).
+ *   - `"score"` (`u`) — presence-checked via `g_variant_lookup()`'s own
+ *     return value (`has_score`): the daemon omits this key entirely
+ *     outside search paths (see `AppEntry::into_dict`), and an absent key
+ *     must leave match-value untouched rather than force it to `0`.
+ *     gs_app_set_match_value() is only called when `has_score` is TRUE, via
+ *     modulix_match_value().
+ *   - `"installed"` (`b`) — presence-checked the same way; when present,
+ *     its value is authoritative and @p is_installed is ignored; when
  *     absent (a daemon predating the field), @p is_installed is used
  *     instead. Before the daemon stamped this on every entry, only the
  *     caller's query path decided the fallback, so search results and
@@ -428,7 +413,7 @@ static gboolean state_is_transient(GsAppState state) {
  *   - `scope` = AS_COMPONENT_SCOPE_SYSTEM (nix/module installs are
  *     system-wide, done by the daemon as root).
  *   - `state` = GS_APP_STATE_INSTALLED/`_AVAILABLE` per the resolved
- *     `installed` value, unless state_is_transient() says the app's
+ *     `installed` value, unless gs_modulix_state_is_transient() says the app's
  *     current state belongs to an in-flight install/uninstall, in which
  *     case the state is left untouched.
  *   - `bundle-kind` = AS_BUNDLE_KIND_PACKAGE — mandatory (together with an
@@ -451,9 +436,9 @@ static gboolean state_is_transient(GsAppState state) {
  *     when `!gs_app_has_icons(app)`. Combined with GsApp reuse via the
  *     plugin cache, this means icon resolution runs at most **once** per
  *     (kind, name): a later call that would have resolved a different
- *     icon (e.g. `icon`/`icon_name` changed in a newer JSON payload) has
- *     no effect, by design (the resolver's contract is exactly one GIcon
- *     per GsApp, see CLAUDE.md "Icons"). A themed win additionally sets
+ *     icon (e.g. `icon`/`icon_name` changed in a newer payload) has no
+ *     effect, by design (the resolver's contract is exactly one GIcon per
+ *     GsApp, see CLAUDE.md "Icons"). A themed win additionally sets
  *     `"modulix::icon-themed"` object data (read by refine to avoid
  *     letting a later remote icon override it).
  *   - `origin` = `"modulix"` for a module, else `name`; `origin-hostname`
@@ -474,41 +459,52 @@ static gboolean state_is_transient(GsAppState state) {
  * `"modulix::flatpak_preferred"` (`g_object_set_data()`, a bare
  * `GINT_TO_POINTER(1)` flag with no destroy, only when `fp_pref` is TRUE).
  * @b Quirk: the three conditional ones are only ever *added or overwritten*,
- * never cleared — on a cache hit, a JSON entry that now omits a
- * field it previously carried (e.g. `icon` becoming empty) leaves the
- * stale previous value in place rather than removing it.
+ * never cleared — on a cache hit, an entry that now omits a field it
+ * previously carried (e.g. `icon` becoming empty) leaves the stale previous
+ * value in place rather than removing it.
  *
- * @param obj JsonObject for one Modulix app entry. Not NULL. Read-only.
+ * @param dict `a{sv}` GVariant for one Modulix app entry. Not NULL,
+ *   read-only, borrowed for the duration of this call.
  * @param plugin GsPlugin used as the app's management plugin and as the
  *   plugin-cache namespace (`gs_plugin_cache_lookup()`/`_add()`). Not
  *   NULL.
- * @param is_installed Fallback installed state, used only when @p obj has
+ * @param is_installed Fallback installed state, used only when @p dict has
  *   no `"installed"` key.
  * @pre None.
  * @post On success, the plugin cache holds a GsApp for key
- *   `"<kind>\x1f<name>"`, newly created or refreshed from @p obj.
+ *   `"<kind>\x1f<name>"`, newly created or refreshed from @p dict.
  * @return A new reference to the GsApp (transfer-full: caller must
  *   g_object_unref()), reused from the plugin cache across calls sharing
- *   the same (kind, name). NULL when @p obj's `"name"` is missing or
+ *   the same (kind, name). NULL when @p dict's `"name"` is missing or
  *   empty.
  */
-GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
-                                     gboolean is_installed) {
-  const gchar *name      = gs_modulix_json_str(obj, "name");
-  const gchar *base_name = gs_modulix_json_str(obj, "base_name");
-  const gchar *pname     = gs_modulix_json_str(obj, "pname");
-  const gchar *a_name    = gs_modulix_json_str(obj, "app_name");
-  const gchar *summary   = gs_modulix_json_str(obj, "summary");
-  const gchar *version   = gs_modulix_json_str(obj, "version");
-  const gchar *app_id    = gs_modulix_json_str(obj, "app_id");
-  const gchar *group_id  = gs_modulix_json_str(obj, "group_id");
-  const gchar *icon      = gs_modulix_json_str(obj, "icon");
-  const gchar *icon_name = gs_modulix_json_str(obj, "icon_name");
-  const gchar *kind      = gs_modulix_json_str(obj, "kind");
-  gboolean fp_pref       = gs_modulix_json_bool(obj, "flatpak_preferred");
-  gint variant_rank      = gs_modulix_json_int(obj, "variant_rank");
-  gboolean has_score     = json_object_has_member(obj, "score");
-  gint score             = has_score ? gs_modulix_json_int(obj, "score") : 0;
+GsApp *gs_modulix_make_app_from_variant(GVariant *dict, GsPlugin *plugin,
+                                        gboolean is_installed) {
+  const gchar *name = NULL, *base_name = NULL, *pname = NULL, *a_name = NULL;
+  const gchar *summary = NULL, *version = NULL, *app_id = NULL,
+             *group_id = NULL;
+  const gchar *icon = NULL, *icon_name = NULL, *kind = NULL;
+  gboolean fp_pref = FALSE;
+  gint variant_rank = 0;
+  guint score = 0;
+  gboolean installed_val = FALSE;
+
+  g_variant_lookup(dict, "name", "&s", &name);
+  g_variant_lookup(dict, "base_name", "&s", &base_name);
+  g_variant_lookup(dict, "pname", "&s", &pname);
+  g_variant_lookup(dict, "app_name", "&s", &a_name);
+  g_variant_lookup(dict, "summary", "&s", &summary);
+  g_variant_lookup(dict, "version", "&s", &version);
+  g_variant_lookup(dict, "app_id", "&s", &app_id);
+  g_variant_lookup(dict, "group_id", "&s", &group_id);
+  g_variant_lookup(dict, "icon", "&s", &icon);
+  g_variant_lookup(dict, "icon_name", "&s", &icon_name);
+  g_variant_lookup(dict, "kind", "&s", &kind);
+  g_variant_lookup(dict, "flatpak_preferred", "b", &fp_pref);
+  g_variant_lookup(dict, "variant_rank", "i", &variant_rank);
+  gboolean has_score = g_variant_lookup(dict, "score", "u", &score);
+  gboolean has_installed =
+      g_variant_lookup(dict, "installed", "b", &installed_val);
 
   if (!name || !*name)
     return NULL;
@@ -517,10 +513,7 @@ GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
     base_name = name;
 
   gboolean is_module = (g_strcmp0(kind, "module") == 0);
-
-  gboolean installed = json_object_has_member(obj, "installed")
-                           ? gs_modulix_json_bool(obj, "installed")
-                           : is_installed;
+  gboolean installed = has_installed ? installed_val : is_installed;
 
   const gchar *app_unique_id = (group_id && *group_id) ? group_id
                                : (app_id && *app_id)    ? app_id
@@ -546,10 +539,10 @@ GsApp *gs_modulix_make_app_from_json(JsonObject *obj, GsPlugin *plugin,
                               : (pname && *pname)    ? pname
                                                       : name;
   gs_app_set_name(app, GS_APP_QUALITY_NORMAL, display_name);
-  gs_app_set_summary(app, GS_APP_QUALITY_NORMAL, summary);
+  gs_app_set_summary(app, GS_APP_QUALITY_NORMAL, summary ? summary : "");
   gs_app_set_kind(app, AS_COMPONENT_KIND_DESKTOP_APP);
   gs_app_set_scope(app, AS_COMPONENT_SCOPE_SYSTEM);
-  if (!state_is_transient(gs_app_get_state(app)))
+  if (!gs_modulix_state_is_transient(gs_app_get_state(app)))
     gs_app_set_state(app, installed ? GS_APP_STATE_INSTALLED
                                     : GS_APP_STATE_AVAILABLE);
   gs_app_set_bundle_kind(app, AS_BUNDLE_KIND_PACKAGE);
@@ -635,7 +628,7 @@ gboolean gs_modulix_app_is_ours(GsApp *app, GsPlugin *plugin) {
 
 /**
  * @brief Reads back the `"modulix::kind"` object data set by
- *        gs_modulix_make_app_from_json()/gs_modulix_add_module_plugins().
+ *        gs_modulix_make_app_from_variant()/gs_modulix_add_module_plugins().
  *
  * @param app GsApp to inspect. Not NULL.
  * @pre None.
@@ -649,7 +642,7 @@ const gchar *gs_modulix_app_kind(GsApp *app) {
 
 /**
  * @brief Reads back the `"modulix::name"` object data set by
- *        gs_modulix_make_app_from_json()/gs_modulix_add_module_plugins().
+ *        gs_modulix_make_app_from_variant()/gs_modulix_add_module_plugins().
  *
  * @param app GsApp to inspect. Not NULL.
  * @pre None.
@@ -666,39 +659,36 @@ const gchar *gs_modulix_app_name(GsApp *app) {
  * @brief Fetches @p module_name's plugin list and attaches it to
  *        @p module_app as ADDON GsApps.
  *
- * Fetches the module's plugin JSON via
+ * Fetches the module's plugin `aa{sv}` via
  * gs_modulix_plugins_cache_get_or_fetch() (`gs-modulix-plugins-cache.h`,
- * not documented here), which returns a JSON string or NULL on failure.
- * The JSON is expected to decode, at its top level, to an array of plugin
- * objects (the `"plugins"` label passed to gs_modulix_json_parse_array()
- * is only used in its parse-error g_warning). Per plugin object:
+ * not documented here), which returns a `GVariant *` or NULL on failure.
+ * Per plugin entry:
  *
- *   - `"name"` — read via gs_modulix_json_str() (`""` default); a plugin
- *     with an empty name is skipped entirely (no addon GsApp is built for
- *     it).
- *   - `"description"` — read the same way, passed to
- *     gs_app_set_summary() verbatim (possibly empty).
- *   - `"installed"` — presence-checked via json_object_has_member(); when
- *     present, its boolean value is used. Unlike
- *     gs_modulix_make_app_from_json(), there is no caller-supplied
- *     fallback parameter here: an absent key defaults to FALSE
- *     unconditionally.
+ *   - `"name"` (`&s`) — a plugin with an empty/absent name is skipped
+ *     entirely (no addon GsApp is built for it).
+ *   - `"description"` (`&s`) — passed to gs_app_set_summary() verbatim
+ *     (possibly empty).
+ *   - `"installed"` (`b`) — presence-checked via `g_variant_lookup()`'s
+ *     return value; unlike gs_modulix_make_app_from_variant(), there is no
+ *     caller-supplied fallback parameter here: an absent key defaults to
+ *     FALSE unconditionally.
  *
- * Unlike gs_modulix_make_app_from_json(), each addon is *always* rebuilt
- * from the freshly-fetched JSON (cheap: it comes from the client-side
- * plugins cache, not a re-run of the daemon's namespace-wide `nix eval`) —
- * this is what lets `installed` refresh every time the details page
- * reopens, instead of freezing at whatever it was on first refine.
+ * Unlike gs_modulix_make_app_from_variant(), each addon is *always*
+ * rebuilt from the freshly-fetched data (cheap: it comes from the
+ * client-side plugins cache, not a re-run of the daemon's namespace-wide
+ * `nix eval`) — this is what lets `installed` refresh every time the
+ * details page reopens, instead of freezing at whatever it was on first
+ * refine.
  *
  * Each addon's GsApp id is `"<module_name>/<plugin name>"`; the *plugin
  * cache* key (`gs_plugin_cache_lookup()`/`_add()`, same reuse pattern as
- * gs_modulix_make_app_from_json()) is `"plugin\x1f<id>"`, guarded by its
+ * gs_modulix_make_app_from_variant()) is `"plugin\x1f<id>"`, guarded by its
  * own function-local static GMutex distinct from the one in
- * gs_modulix_make_app_from_json(). Properties set per addon:
+ * gs_modulix_make_app_from_variant(). Properties set per addon:
  * `management-plugin` = @p plugin; `name` at GS_APP_QUALITY_NORMAL =
  * plugin name; `summary` at GS_APP_QUALITY_NORMAL = description;
  * `kind` = AS_COMPONENT_KIND_ADDON; `state` = INSTALLED/AVAILABLE per
- * the resolved `installed` value, unless state_is_transient() says the
+ * the resolved `installed` value, unless gs_modulix_state_is_transient() says the
  * addon's current state must be left alone; `bundle-kind` =
  * AS_BUNDLE_KIND_PACKAGE. Object data: `"modulix::kind"` = `"plugin"`,
  * `"modulix::name"` = the addon id, `"modulix::parent"` = @p
@@ -711,96 +701,166 @@ const gchar *gs_modulix_app_name(GsApp *app) {
  *   plugin-cache namespace. Not NULL.
  * @pre None.
  * @post Every named plugin of @p module_name has an up-to-date addon
- *   GsApp in the plugin cache. @b Quirk: gs_app_add_addons() is not
- *   idempotent — there is no public addon getter to de-dup against
- *   (`gs_app_dup_addons` lives in the unexported `gs-app-private.h`) — so
- *   this function only calls it the *first* time it finds at least one
- *   plugin for @p module_app (guarded by the `"modulix::addons-added"`
- *   object data on @p module_app); a later call with a different plugin
- *   set (e.g. a plugin added to the module since) will refresh each
- *   existing addon's own state but will not add any newly-appeared addon
- *   to @p module_app's addon list.
- * @return None. A NULL fetch, an unparsable/non-array JSON, or an empty
- *   plugin array leaves @p module_app unchanged.
+ *   GsApp in the plugin cache, attached to @p module_app as an addon.
+ *   gs_app_add_addons() is called unconditionally on every call — it goes
+ *   through gs_app_list_add_safe(…CHECK_FOR_DUPE) (`lib/gs-app-list.c`),
+ *   already idempotent on the same GsApp pointer, so a plugin that
+ *   appeared since the previous call (e.g. added to the module) is picked
+ *   up without needing a fresh @p module_app instance.
+ * @return None. A NULL fetch or an empty plugin array leaves @p module_app
+ *   unchanged.
  */
 void gs_modulix_add_module_plugins(GsApp *module_app, const gchar *module_name,
                                    GsPlugin *plugin) {
-  g_autofree gchar *json = gs_modulix_plugins_cache_get_or_fetch(module_name);
-  if (json == NULL)
-    return;
-
-  g_autoptr(JsonParser) parser = json_parser_new();
-  JsonArray *array = gs_modulix_json_parse_array(parser, json, "plugins");
-  if (array == NULL)
+  g_autoptr(GVariant) plugins =
+      gs_modulix_plugins_cache_get_or_fetch(module_name);
+  if (plugins == NULL)
     return;
 
   g_autoptr(GsAppList) addons = gs_app_list_new();
+  gs_modulix_append_plugin_apps_from_variant(addons, plugins, plugin,
+                                             module_name);
+
+  if (gs_app_list_length(addons) > 0)
+    gs_app_add_addons(module_app, addons);
+}
+
+/**
+ * @brief Builds (or reuses) the addon GsApp for one Modulix `a{sv}` plugin
+ *        entry.
+ *
+ * Same GsApp-cache reuse rationale as gs_modulix_make_app_from_variant():
+ * the cache key is `"plugin\x1f<module>/<name>"`, so the same addon GsApp
+ * is shared between a module's details page and the "Installed" page's
+ * Add-ons section, which is what lets a plugin's installed state survive
+ * across both.
+ *
+ * @param dict `a{sv}` GVariant decoded from one element of a Modulix plugin
+ *   `aa{sv}` array (`ListModulePlugins` or `ListInstalledPlugins`).
+ *   Read-only, borrowed for the duration of this call. Not NULL.
+ * @param plugin GsPlugin this addon is attached to: management plugin and
+ *   plugin-cache namespace. Not NULL.
+ * @param module_fallback Module key used when @p dict has no `"module"`
+ *   member (the `ListModulePlugins` shape, where the caller already knows
+ *   the module). Ignored whenever @p dict carries `"module"` (the
+ *   `ListInstalledPlugins` shape). Not NULL.
+ * @pre None.
+ * @post A GsApp exists in the plugin cache under key
+ *   `"plugin\x1f<module>/<name>"`, populated/refreshed from @p dict's
+ *   fields. Description seeded at GS_APP_QUALITY_LOWEST so the addon still
+ *   passes gs_installed_page_is_actual_app()'s no-description filter even
+ *   with no daemon-provided description. Icon resolved via
+ *   gs_modulix_icon_resolve() when the addon has none yet, so it is never
+ *   dropped by the loader for lack of an icon.
+ * @return A new reference to the addon GsApp (transfer-full: the caller
+ *   must g_object_unref() it), reused from the plugin cache across calls
+ *   sharing the same (module, name). NULL when @p dict has no non-empty
+ *   `"name"` key.
+ */
+GsApp *gs_modulix_make_plugin_app_from_variant(GVariant *dict,
+                                               GsPlugin *plugin,
+                                               const gchar *module_fallback) {
+  const gchar *pname = NULL;
+  g_variant_lookup(dict, "name", "&s", &pname);
+  if (!pname || !*pname)
+    return NULL;
+
+  const gchar *desc = NULL;
+  g_variant_lookup(dict, "description", "&s", &desc);
+  const gchar *module_name = NULL;
+  g_variant_lookup(dict, "module", "&s", &module_name);
+  if (!module_name || !*module_name)
+    module_name = module_fallback;
+  gboolean installed = FALSE;
+  g_variant_lookup(dict, "installed", "b", &installed);
+
+  g_autofree gchar *id = g_strdup_printf("%s/%s", module_name, pname);
+  g_autofree gchar *cache_key = g_strdup_printf("plugin\x1f%s", id);
+
   static GMutex plugin_cache_key_mutex;
-  for (guint i = 0; i < json_array_get_length(array); i++) {
-    JsonObject *obj = json_array_get_object_element(array, i);
-    const gchar *pname = gs_modulix_json_str(obj, "name");
-    const gchar *desc = gs_modulix_json_str(obj, "description");
-    if (!pname || !*pname)
-      continue;
-    gboolean installed = json_object_has_member(obj, "installed")
-                             ? gs_modulix_json_bool(obj, "installed")
-                             : FALSE;
-
-    g_autofree gchar *id = g_strdup_printf("%s/%s", module_name, pname);
-    g_autofree gchar *cache_key =
-        g_strdup_printf("plugin\x1f%s", id);
-
-    GsApp *addon;
-    {
-      g_autoptr(GMutexLocker) locker =
-          g_mutex_locker_new(&plugin_cache_key_mutex);
-      addon = gs_plugin_cache_lookup(plugin, cache_key);
-      if (addon == NULL) {
-        addon = gs_app_new(id);
-        gs_plugin_cache_add(plugin, cache_key, addon);
-      }
+  GsApp *addon;
+  {
+    g_autoptr(GMutexLocker) locker =
+        g_mutex_locker_new(&plugin_cache_key_mutex);
+    addon = gs_plugin_cache_lookup(plugin, cache_key);
+    if (addon == NULL) {
+      addon = gs_app_new(id);
+      gs_plugin_cache_add(plugin, cache_key, addon);
     }
-
-    gs_app_set_management_plugin(addon, plugin);
-    gs_app_set_name(addon, GS_APP_QUALITY_NORMAL, pname);
-    gs_app_set_summary(addon, GS_APP_QUALITY_NORMAL, desc);
-    gs_app_set_kind(addon, AS_COMPONENT_KIND_ADDON);
-    if (!state_is_transient(gs_app_get_state(addon)))
-      gs_app_set_state(addon, installed ? GS_APP_STATE_INSTALLED
-                                        : GS_APP_STATE_AVAILABLE);
-    gs_app_set_bundle_kind(addon, AS_BUNDLE_KIND_PACKAGE);
-    g_object_set_data_full(G_OBJECT(addon), "modulix::kind", g_strdup("plugin"),
-                           g_free);
-    g_object_set_data_full(G_OBJECT(addon), "modulix::name", g_strdup(id),
-                           g_free);
-    g_object_set_data_full(G_OBJECT(addon), "modulix::parent",
-                           g_strdup(module_name), g_free);
-    g_object_set_data_full(G_OBJECT(addon), "modulix::plugin_name",
-                           g_strdup(pname), g_free);
-    gs_app_list_add(addons, addon);
-    g_object_unref(addon);
   }
 
-  if (gs_app_list_length(addons) > 0 &&
-      !g_object_get_data(G_OBJECT(module_app), "modulix::addons-added")) {
-    gs_app_add_addons(module_app, addons);
-    g_object_set_data(G_OBJECT(module_app), "modulix::addons-added",
-                      GINT_TO_POINTER(1));
+  gs_app_set_management_plugin(addon, plugin);
+  gs_app_set_name(addon, GS_APP_QUALITY_NORMAL, pname);
+  gs_app_set_summary(addon, GS_APP_QUALITY_NORMAL, desc ? desc : "");
+  g_autofree gchar *fallback_desc = NULL;
+  if (!desc || !*desc)
+    fallback_desc = g_strdup_printf(_("Plugin for %s"), module_name);
+  gs_app_set_description(addon, GS_APP_QUALITY_LOWEST,
+                         (desc && *desc) ? desc : fallback_desc);
+  gs_app_set_kind(addon, AS_COMPONENT_KIND_ADDON);
+  if (!gs_modulix_state_is_transient(gs_app_get_state(addon)))
+    gs_app_set_state(addon, installed ? GS_APP_STATE_INSTALLED
+                                      : GS_APP_STATE_AVAILABLE);
+  gs_app_set_bundle_kind(addon, AS_BUNDLE_KIND_PACKAGE);
+  if (!gs_app_has_icons(addon))
+    gs_modulix_icon_resolve(addon, NULL, NULL, pname, NULL, NULL);
+  g_object_set_data_full(G_OBJECT(addon), "modulix::kind", g_strdup("plugin"),
+                         g_free);
+  g_object_set_data_full(G_OBJECT(addon), "modulix::name", g_strdup(id),
+                         g_free);
+  g_object_set_data_full(G_OBJECT(addon), "modulix::parent",
+                         g_strdup(module_name), g_free);
+  g_object_set_data_full(G_OBJECT(addon), "modulix::plugin_name",
+                         g_strdup(pname), g_free);
+  return addon;
+}
+
+/**
+ * @brief Appends every plugin decoded from a Modulix `aa{sv}` plugin array
+ *        to @p list.
+ *
+ * @param list GsAppList to append to. Not NULL. Mutated: gains one addon
+ *   GsApp per non-NULL-name entry of @p array.
+ * @param array `aa{sv}` GVariant. Borrowed for the duration of this call.
+ *   NULL is tolerated: nothing is appended.
+ * @param plugin GsPlugin forwarded to
+ *   gs_modulix_make_plugin_app_from_variant() for every entry. Not NULL.
+ * @param module_fallback Forwarded to
+ *   gs_modulix_make_plugin_app_from_variant() for every entry. Not NULL.
+ * @pre None.
+ * @post @p list holds the newly-built plugin apps.
+ * @return None.
+ */
+void gs_modulix_append_plugin_apps_from_variant(GsAppList *list,
+                                                GVariant *array,
+                                                GsPlugin *plugin,
+                                                const gchar *module_fallback) {
+  if (array == NULL)
+    return;
+
+  GVariantIter iter;
+  g_variant_iter_init(&iter, array);
+  GVariant *dict;
+  while ((dict = g_variant_iter_next_value(&iter)) != NULL) {
+    GsApp *app =
+        gs_modulix_make_plugin_app_from_variant(dict, plugin, module_fallback);
+    g_variant_unref(dict);
+    if (app == NULL)
+      continue;
+    gs_app_list_add(list, app);
+    g_object_unref(app);
   }
 }
 
 /**
- * @brief Appends every app decoded from a Modulix JSON `"apps"` array to
+ * @brief Appends every app decoded from a Modulix `aa{sv}` array to
  *        @p list, deduplicating by GsApp id when @p seen_ids is given.
  *
- * @p json is expected to decode, at its top level, to a JSON array of app
- * objects (the `"apps"` label passed to gs_modulix_json_parse_array() is
- * only used in its parse-error g_warning, not looked up as a key). NULL,
- * empty, malformed or non-array JSON is tolerated: the function returns
- * without appending anything (a warning is logged for a genuine parse
- * failure by gs_modulix_json_parse_array()).
+ * @p array is NULL-tolerated: the daemon call already failed and logged its
+ * own warning (see `plugin/src/dbus/gs-modulix-store1.c`) — the function
+ * simply appends nothing.
  *
- * Each array element is passed to gs_modulix_make_app_from_json() with
+ * Each array element is passed to gs_modulix_make_app_from_variant() with
  * @p plugin/@p is_installed forwarded unchanged; a NULL result (missing
  * `"name"`) is silently skipped. When @p seen_ids is non-NULL, an app
  * whose gs_app_get_id() is already a member is unreffed and dropped
@@ -821,31 +881,32 @@ void gs_modulix_add_module_plugins(GsApp *module_app, const gchar *module_name,
  *
  * @param list GsAppList to append to. Not NULL. Mutated as described
  *   above.
- * @param json Raw JSON text for the `"apps"` array. Nullable.
- * @param plugin GsPlugin forwarded to gs_modulix_make_app_from_json() for
+ * @param array `aa{sv}` GVariant. Borrowed for the duration of this call.
+ *   NULL is tolerated.
+ * @param plugin GsPlugin forwarded to gs_modulix_make_app_from_variant() for
  *   every entry. Not NULL.
  * @param is_installed Fallback installed state forwarded to
- *   gs_modulix_make_app_from_json() for every entry.
- * @param parser JsonParser reused to decode @p json; its internal parse
- *   tree is overwritten by this call. Not NULL.
+ *   gs_modulix_make_app_from_variant() for every entry.
  * @param seen_ids Nullable GHashTable<owned gchar*, unused> for
  *   cross-call id dedup; see above. Not freed by this function.
- * @pre @p parser and @p seen_ids (when non-NULL) are valid.
+ * @pre @p seen_ids (when non-NULL) is valid.
  * @post @p list holds the newly-built, non-duplicate apps; @p seen_ids
  *   (when given) gained their ids.
  * @return None.
  */
-void gs_modulix_append_apps_from_json(GsAppList *list, const gchar *json,
-                                      GsPlugin *plugin, gboolean is_installed,
-                                      JsonParser *parser,
-                                      GHashTable *seen_ids) {
-  JsonArray *array = gs_modulix_json_parse_array(parser, json, "apps");
+void gs_modulix_append_apps_from_variant(GsAppList *list, GVariant *array,
+                                         GsPlugin *plugin,
+                                         gboolean is_installed,
+                                         GHashTable *seen_ids) {
   if (array == NULL)
     return;
 
-  for (guint i = 0; i < json_array_get_length(array); i++) {
-    JsonObject *obj = json_array_get_object_element(array, i);
-    GsApp *app = gs_modulix_make_app_from_json(obj, plugin, is_installed);
+  GVariantIter iter;
+  g_variant_iter_init(&iter, array);
+  GVariant *dict;
+  while ((dict = g_variant_iter_next_value(&iter)) != NULL) {
+    GsApp *app = gs_modulix_make_app_from_variant(dict, plugin, is_installed);
+    g_variant_unref(dict);
     if (app == NULL)
       continue;
     if (seen_ids != NULL) {

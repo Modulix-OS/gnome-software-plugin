@@ -8,29 +8,29 @@
  * worker thread drains the queue, merges everything pending into one call per
  * operation, and completes every queued task with the shared result.
  *
- * Each `mx_store_*` write call this file makes is a full, synchronous NixOS
- * rebuild carried out by `mx-daemon` (see `modulix-daemon/src/command/`):
- * the daemon checks polkit authorisation before running the command
- * (`Command::execute`'s precondition, `modulix-daemon/src/command/mod.rs`),
- * then runs the corresponding blocking `modulix-core-utils` call via
- * `spawn_blocking` (see the `lifecycle_commands!` macro,
- * `modulix-daemon/src/command/lifecycle.rs`). The `mx_store_*` shim
- * (`modulix-store-client/src/ffi.rs`) uses a *blocking* zbus connection, so
- * the whole rebuild — commonly minutes — blocks whichever thread in this
- * process calls it; here that is always the private drain worker thread
- * (drain_worker()), never the main thread.
+ * Each write call this file makes (via `plugin/src/dbus/gs-modulix-daemon1.c`)
+ * is a full, synchronous NixOS rebuild carried out by `mx-daemon` (see
+ * `modulix-daemon/src/command/`): the daemon checks polkit authorisation
+ * before running the command (`Command::execute`'s precondition,
+ * `modulix-daemon/src/command/mod.rs`), then runs the corresponding
+ * blocking `modulix-core-utils` call via `spawn_blocking` (see the
+ * `lifecycle_commands!` macro, `modulix-daemon/src/command/lifecycle.rs`).
+ * `gs_modulix_bus_call()` is a *synchronous* GDBus call with no timeout for
+ * a write (`G_MAXINT`), so the whole rebuild — commonly minutes — blocks
+ * whichever thread in this process calls it; here that is always the
+ * private drain worker thread (drain_worker()), never the main thread.
  *
- * Failure detail stops at the shim: mx_store_* writes collapse every failure
- * mode (bus down, D-Bus error, denied polkit prompt, daemon-side transaction
- * failure) to NULL, so the whole batch gets one generic
- * %GS_PLUGIN_ERROR_FAILED #GError (see lifecycle_execute()). A denied polkit
- * prompt is therefore reported to GNOME Software exactly like any other
- * daemon-side failure — there is no distinct "you refused authorisation"
- * path here. Separately, the daemon also emits a `CommandFailed` D-Bus signal
- * on failure, which `gs-modulix-failure-monitor.c` turns into a desktop
- * notification with a "View error" button (the Nix rebuild log); that is an
- * independent, main-thread-only reporting path and not wired into the
- * `GError`/`GTask` flow implemented in this file.
+ * Failure detail: unlike the old `mx_store_*` shim (which collapsed every
+ * failure mode to an undifferentiated NULL), a GDBus call failure now
+ * carries a real `GError` (D-Bus error name + message, including a denied
+ * polkit prompt) — logged at `g_warning` by status_ok() — but the batch
+ * still gets one generic %GS_PLUGIN_ERROR_FAILED #GError from
+ * lifecycle_execute(), since GNOME Software has no richer per-cause UI for
+ * this failure. Separately, the daemon also emits a `CommandFailed` D-Bus
+ * signal on failure, which `gs-modulix-failure-monitor.c` turns into a
+ * desktop notification with a "View error" button (the Nix rebuild log);
+ * that is an independent, main-thread-only reporting path and not wired
+ * into the `GError`/`GTask` flow implemented in this file.
  *
  * No progress is reported to the UI while a call is in flight: the
  * `install_apps`/`uninstall_apps` vfuncs accept a `GsPluginProgressCallback`
@@ -57,7 +57,7 @@
 #include "gs-modulix-config.h"
 #include "gs-modulix-plugins-cache.h"
 
-#include "modulix-store-client.h"
+#include "dbus/gs-modulix-daemon1.h"
 
 /**
  * @brief Instance data of the coalescing lifecycle queue.
@@ -84,90 +84,63 @@ struct _GsModulixLifecycle {
 /* ── operations ─────────────────────────────────────────────────────────── */
 
 /**
- * @brief Signature shared by the batched `mx_store_{install,uninstall}_{packages,modules}`
- * entry points.
- *
- * @param names NULL-terminated array of package or module names to act on.
- * Borrowed for the duration of the call.
- * @param n Number of entries in @p names (excluding the NULL terminator).
- *
- * @return A newly allocated status string on success, which the caller must
- * free with `mx_store_free_string()`; NULL on any failure (bus unreachable,
- * D-Bus error, denied polkit authorisation, or daemon-side rebuild failure —
- * indistinguishable from one another at this level).
- */
-typedef gchar *(*ModulixNamesFn)(const gchar *const *names, guint n);
-
-/**
- * @brief Signature shared by `mx_store_{install,uninstall}_plugin`.
- *
- * @param module Module key owning the plugin. Borrowed for the duration of
- * the call.
- * @param plugin Plugin key within that module. Borrowed for the duration of
- * the call.
- *
- * @return A newly allocated status string on success, which the caller must
- * free with `mx_store_free_string()`; NULL on any failure, with the same
- * causes and the same loss of detail as #ModulixNamesFn.
- */
-typedef gchar *(*ModulixPluginFn)(const gchar *module, const gchar *plugin);
-
-/**
  * @brief Everything that differs between an install run and an uninstall run:
- * which `mx_store_*` symbols to call, and which #GsAppState an app should
- * carry before, on success, and on failure.
+ * which `org.modulix.Daemon` method names to call, and which #GsAppState an
+ * app should carry before, on success, and on failure.
  *
- * @var LifecycleOps::pkg_fn
- * Batched call for apps of kind `"package"`; NULL-safe target of
- * #ModulixNamesFn (`mx_store_install_packages` / `mx_store_uninstall_packages`).
- * @var LifecycleOps::mod_fn
- * Batched call for apps of kind `"module"` (`mx_store_install_modules` /
- * `mx_store_uninstall_modules`).
- * @var LifecycleOps::plugin_fn
- * Per-app call for apps of kind `"plugin"` (`mx_store_install_plugin` /
- * `mx_store_uninstall_plugin`) — the daemon has no batched form for plugins.
+ * @var LifecycleOps::pkg_method
+ * D-Bus method for the batched call over apps of kind `"package"`
+ * (`"InstallPackage"` / `"UninstallPackage"`), passed to
+ * gs_modulix_daemon1_names_call().
+ * @var LifecycleOps::mod_method
+ * D-Bus method for the batched call over apps of kind `"module"`
+ * (`"InstallModule"` / `"UninstallModule"`).
+ * @var LifecycleOps::plugin_method
+ * D-Bus method for the per-app call over apps of kind `"plugin"`
+ * (`"InstallPlugin"` / `"UninstallPlugin"`), passed to
+ * gs_modulix_daemon1_plugin_call() — the daemon has no batched form for
+ * plugins.
  * @var LifecycleOps::in_progress
  * State applied immediately (main thread, in enqueue_lifecycle()) to every
  * owned app being queued, before any daemon call runs.
  * @var LifecycleOps::on_success
- * State applied to an app's kind-group once its `mx_store_*` call returns a
- * non-NULL status.
+ * State applied to an app's kind-group once its daemon call succeeds.
  * @var LifecycleOps::on_failure
- * State applied to an app's kind-group once its `mx_store_*` call returns
- * NULL — i.e. the state is rolled back to what it was before `in_progress`.
+ * State applied to an app's kind-group once its daemon call fails — i.e.
+ * the state is rolled back to what it was before `in_progress`.
  */
 typedef struct {
-  ModulixNamesFn pkg_fn;
-  ModulixNamesFn mod_fn;
-  ModulixPluginFn plugin_fn;
+  const gchar *pkg_method;
+  const gchar *mod_method;
+  const gchar *plugin_method;
   GsAppState in_progress;
   GsAppState on_success;
   GsAppState on_failure;
 } LifecycleOps;
 
 /**
- * @brief #LifecycleOps for an install run: `mx_store_install_*`,
+ * @brief #LifecycleOps for an install run: `Install*`,
  * %GS_APP_STATE_INSTALLING while in flight, %GS_APP_STATE_INSTALLED on
  * success, back to %GS_APP_STATE_AVAILABLE on failure.
  */
 static const LifecycleOps install_ops = {
-    .pkg_fn = mx_store_install_packages,
-    .mod_fn = mx_store_install_modules,
-    .plugin_fn = mx_store_install_plugin,
+    .pkg_method = "InstallPackage",
+    .mod_method = "InstallModule",
+    .plugin_method = "InstallPlugin",
     .in_progress = GS_APP_STATE_INSTALLING,
     .on_success = GS_APP_STATE_INSTALLED,
     .on_failure = GS_APP_STATE_AVAILABLE,
 };
 
 /**
- * @brief #LifecycleOps for an uninstall run: `mx_store_uninstall_*`,
+ * @brief #LifecycleOps for an uninstall run: `Uninstall*`,
  * %GS_APP_STATE_REMOVING while in flight, %GS_APP_STATE_AVAILABLE on
  * success, back to %GS_APP_STATE_INSTALLED on failure.
  */
 static const LifecycleOps uninstall_ops = {
-    .pkg_fn = mx_store_uninstall_packages,
-    .mod_fn = mx_store_uninstall_modules,
-    .plugin_fn = mx_store_uninstall_plugin,
+    .pkg_method = "UninstallPackage",
+    .mod_method = "UninstallModule",
+    .plugin_method = "UninstallPlugin",
     .in_progress = GS_APP_STATE_REMOVING,
     .on_success = GS_APP_STATE_AVAILABLE,
     .on_failure = GS_APP_STATE_INSTALLED,
@@ -280,40 +253,67 @@ static GPtrArray *names_of_kind(GPtrArray *apps, const gchar *kind) {
  * @brief Tells whether an `mx_store_*` write call succeeded, and frees its
  * result either way.
  *
- * @param status The string returned by an `mx_store_install_*` /
- * `mx_store_uninstall_*` call: NULL on failure (bus down, D-Bus error, denied
- * polkit authorisation, or daemon-side rebuild failure — this string carries
- * no way to tell which), or a non-NULL status string on success. Ownership
- * transfers to this function either way.
+ * @param method D-Bus method name, used only in the warning logged on
+ * failure.
+ * @param names NULL-terminated array of package or module names, forwarded
+ * to gs_modulix_daemon1_names_call().
  *
- * @return TRUE when @p status was non-NULL (the daemon replied without a
- * D-Bus error, i.e. the rebuild it performed succeeded), FALSE when it was
- * NULL.
- * @post @p status is freed with `mx_store_free_string()` when non-NULL; the
- * caller must not use or free it afterwards either way.
+ * @return TRUE on success; FALSE on any failure (bus unreachable, D-Bus
+ * error, denied polkit authorisation, or daemon-side rebuild failure) —
+ * the underlying `GError`, now available where the old shim only had an
+ * undifferentiated NULL, is logged at `g_warning` before being discarded,
+ * since this file's callers still only need the boolean outcome.
  */
-static gboolean status_ok(gchar *status) {
-  if (status == NULL)
+static gboolean call_names(const gchar *method, const gchar *const *names) {
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *status =
+      gs_modulix_daemon1_names_call(method, names, &error);
+  if (status == NULL) {
+    g_warning("[modulix] Daemon.%s: %s", method, error->message);
     return FALSE;
-  mx_store_free_string(status);
+  }
   return TRUE;
 }
 
 /**
- * @brief Runs one batched `mx_store_*` call for every @p kind app in @p apps,
- * then applies the resulting success/failure #GsAppState to that group.
+ * @brief Calls one `org.modulix.Daemon` plugin method and reports success.
+ *
+ * @param method D-Bus method name (`"InstallPlugin"`/`"UninstallPlugin"`),
+ * used only in the warning logged on failure.
+ * @param module Module key owning the plugin.
+ * @param plugin Plugin key within that module.
+ *
+ * @return TRUE on success; FALSE on failure, with the same logging as
+ * call_names().
+ */
+static gboolean call_plugin(const gchar *method, const gchar *module,
+                            const gchar *plugin) {
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *status =
+      gs_modulix_daemon1_plugin_call(method, module, plugin, &error);
+  if (status == NULL) {
+    g_warning("[modulix] Daemon.%s: %s", method, error->message);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * @brief Runs one batched `org.modulix.Daemon` call for every @p kind app in
+ * @p apps, then applies the resulting success/failure #GsAppState to that
+ * group.
  *
  * This is the call that performs the blocking NixOS rebuild for package and
  * module operations (`MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES`
- * gated in lifecycle_execute()): @p fn blocks the calling thread —
+ * gated in lifecycle_execute()): call_names() blocks the calling thread —
  * drain_worker(), never the main thread — for as long as the daemon takes to
  * authorise (polkit, daemon-side) and apply the change.
  *
  * @param apps Full merged batch of apps for this run (all kinds mixed). Only
  * the @p kind subset is read or have their state changed.
  * @param kind Kind to filter on (`"package"` or `"module"`).
- * @param fn The batched daemon-call function to invoke for this kind's names
- * (`ops->pkg_fn` or `ops->mod_fn`).
+ * @param method D-Bus method to invoke for this kind's names
+ * (`ops->pkg_method` or `ops->mod_method`).
  * @param ops Supplies the success/failure #GsAppState to apply
  * (`ops->on_success` / `ops->on_failure`); `ops->in_progress` is not touched
  * here (already applied earlier, in enqueue_lifecycle()).
@@ -325,20 +325,19 @@ static gboolean status_ok(gchar *status) {
  * no app of @p kind is present, no daemon call is made and no state changes.
  */
 static gboolean call_for_kind(GPtrArray *apps, const gchar *kind,
-                              ModulixNamesFn fn, const LifecycleOps *ops) {
+                              const gchar *method, const LifecycleOps *ops) {
   g_autoptr(GPtrArray) names = names_of_kind(apps, kind);
-  guint n = names->len - 1; /* minus the NULL terminator */
 
-  if (n == 0)
+  if (names->len == 1) /* just the NULL terminator */
     return TRUE;
 
-  gboolean ok = status_ok(fn((const gchar *const *)names->pdata, n));
+  gboolean ok = call_names(method, (const gchar *const *)names->pdata);
   set_group_state(apps, kind, ok ? ops->on_success : ops->on_failure);
   return ok;
 }
 
 /**
- * @brief Runs one `mx_store_*` plugin call per `"plugin"`-kind app in
+ * @brief Runs one `org.modulix.Daemon` plugin call per `"plugin"`-kind app in
  * @p apps, stopping at the first failure.
  *
  * Module plugins are installed one call apiece — the daemon's
@@ -352,7 +351,7 @@ static gboolean call_for_kind(GPtrArray *apps, const gchar *kind,
  * plugin name are read from its `"modulix::parent"` /
  * `"modulix::plugin_name"` object data (set when the addon `GsApp` was
  * created — see gs-modulix-app.c).
- * @param ops Supplies `ops->plugin_fn` (the daemon call to make) and the
+ * @param ops Supplies `ops->plugin_method` (the daemon call to make) and the
  * success/failure #GsAppState to apply.
  *
  * @return TRUE if every plugin call succeeded (or there were none); FALSE at
@@ -377,10 +376,10 @@ static gboolean call_for_plugins(GPtrArray *apps, const LifecycleOps *ops) {
     const gchar *pname =
         g_object_get_data(G_OBJECT(app), "modulix::plugin_name");
 
-    gboolean pok = status_ok(ops->plugin_fn(parent, pname));
+    gboolean pok = call_plugin(ops->plugin_method, parent, pname);
     gs_app_set_state(app, pok ? ops->on_success : ops->on_failure);
     /* The plugins-list cache has no TTL of its own (see
-     * gs-modulix-plugins-cache.c): without this, the JSON fetched before
+     * gs-modulix-plugins-cache.c): without this, the payload fetched before
      * this install/uninstall — its `installed` bit necessarily stale now —
      * would keep being served for the rest of the process's life. */
     if (pok)
@@ -407,12 +406,12 @@ static gboolean call_for_plugins(GPtrArray *apps, const LifecycleOps *ops) {
  * functions.
  * @param ops Which operation to run: #install_ops or #uninstall_ops.
  * @param error On failure, set to a %GS_PLUGIN_ERROR_FAILED #GError with a
- * generic "Modulix daemon call failed" message — the shim doesn't carry
- * structured D-Bus/polkit error detail back through its status string, only
- * success/failure, so no more specific reason (including "authorisation was
- * refused") can be reported here. Left untouched on success. May be NULL to
- * ignore the error (not done by this file's own callers, which always pass a
- * live `GError **`).
+ * generic "Modulix daemon call failed" message — GNOME Software has no
+ * richer per-cause UI for this failure, though the real reason (including
+ * "authorisation was refused") is now logged by call_names()/call_plugin()
+ * where the old shim's undifferentiated NULL could not surface it at all.
+ * Left untouched on success. May be NULL to ignore the error (not done by
+ * this file's own callers, which always pass a live `GError **`).
  *
  * @return TRUE if every call made succeeded (or a given kind/plugin had
  * nothing to do); FALSE at the first call that failed, at which point
@@ -431,12 +430,12 @@ static gboolean lifecycle_execute(GPtrArray *apps, const LifecycleOps *ops,
 
 #if MODULIX_ENABLE_PACKAGES
   if (ok)
-    ok = call_for_kind(apps, "package", ops->pkg_fn, ops);
+    ok = call_for_kind(apps, "package", ops->pkg_method, ops);
 #endif
 
 #if MODULIX_ENABLE_MODULES
   if (ok)
-    ok = call_for_kind(apps, "module", ops->mod_fn, ops);
+    ok = call_for_kind(apps, "module", ops->mod_method, ops);
 #endif
 
   if (ok)

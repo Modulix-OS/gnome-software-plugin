@@ -22,7 +22,8 @@
  * then run once, but only if the plugin is still enabled at construction
  * time; a `setup_finish` error disables the plugin for the rest of the
  * process's life. After a successful setup, `list_apps_async`,
- * `refine_async`, `install_apps_async` and `uninstall_apps_async` are each
+ * `refresh_metadata_async`, `refine_async`, `update_apps_async`,
+ * `install_apps_async` and `uninstall_apps_async` are each
  * invoked by GsPluginLoader an arbitrary number of times, in whatever order
  * the UI issues jobs — GsPluginClass defines no fixed relative order between
  * them. `finalize` runs once, when the GsPlugin object is disposed (process
@@ -31,35 +32,38 @@
  * Threads: `setup_async` runs its own body synchronously on the thread that
  * calls it — the main thread, per the comments on the icon-theme/resolver
  * setup calls it makes — it never hops to a worker despite the `_async` name.
- * `list_apps_async` and `refine_async` hand off to gs-modulix-list.c /
- * gs-modulix-refine.c, which reject or short-circuit synchronously on the
- * calling thread when they can, and otherwise run their body on a GLib
- * worker-pool thread via `g_task_run_in_thread()`. `install_apps_async` and
- * `uninstall_apps_async` hand off to gs-modulix-lifecycle.c: enqueueing (and
- * moving the apps to their transient in-progress state) happens
- * synchronously on the calling thread, while the actual `mx_store_*` write
- * call runs on one dedicated, serialized `GThread` ("modulix-lifecycle")
- * shared by every coalesced install/uninstall.
+ * `list_apps_async`, `refresh_metadata_async` and `refine_async` hand off to
+ * gs-modulix-list.c / gs-modulix-update.c / gs-modulix-refine.c, which
+ * reject or short-circuit synchronously on the calling thread when they can,
+ * and otherwise run their body on a GLib worker-pool thread via
+ * `g_task_run_in_thread()`. `install_apps_async` and `uninstall_apps_async`
+ * hand off to gs-modulix-lifecycle.c: enqueueing (and moving the apps to
+ * their transient in-progress state) happens synchronously on the calling
+ * thread, while the actual daemon write call runs on one dedicated,
+ * serialized `GThread` ("modulix-lifecycle") shared by every coalesced
+ * install/uninstall. `update_apps_async` hands off to gs-modulix-update.c,
+ * which similarly moves the "Modulix OS" app to its transient state
+ * synchronously before running the blocking `UpdateSystem` call on a GLib
+ * worker-pool thread, guarded by its own process-wide in-flight flag (at
+ * most one system update at a time, never coalesced like install/uninstall).
  *
- * Reaching the daemon: this file itself calls only `mx_store_init()`
- * (`setup_async`) and `mx_store_shutdown()` (`finalize`) directly — it has no
- * GDBus/GVariant code of its own. Every other `mx_store_*` call (searches,
+ * Reaching the daemon: this file itself calls only `gs_modulix_bus_init()`
+ * (`setup_async`) and `gs_modulix_bus_shutdown()` (`finalize`) directly, via
+ * `plugin/src/dbus/gs-modulix-bus.h` — the single system-bus connection
+ * shared by every other `dbus/` wrapper. Every other D-Bus call (searches,
  * listings, enrichment, licenses, install/uninstall writes) is made by the
- * sibling files below, always through `modulix-store-client`'s C ABI
- * (`modulix-store-client.h`), never by hand-rolled D-Bus code. Every
- * `mx_store_*` read returns a heap-allocated, NUL-terminated JSON C string
- * (a write returns a plain status string) that the caller owns and must
- * release with `mx_store_free_string()`; a NULL return always means the call
- * failed (bad UTF-8 input, no bus connection, a D-Bus error, or — for writes
- * — a denied polkit prompt), with no further detail surfacing into this repo
- * (see `../modulix-store-client/src/ffi.rs`).
+ * sibling files below, always through `plugin/src/dbus/gs-modulix-store1.h`/
+ * `gs-modulix-daemon1.h`'s synchronous GDBus/GVariant wrappers, never by
+ * JSON. A failed read logs its own warning and returns NULL, which this
+ * plugin's consumers treat as "0 results"; a failed write returns NULL with
+ * the reason in a `GError` (bad UTF-8 input, no bus connection, a D-Bus
+ * error, or — for writes — a denied polkit prompt).
  *
  * Both reads (search / list / metadata) and writes (install / uninstall) go
- * through the `modulix-store-client` shim (`modulix-store-client.h`,
- * `mx_store_*`), a thin C ABI over two D-Bus interfaces served by the
- * `mx-daemon` system daemon: `org.modulix.Store1` (reads, JSON payloads
- * reshaped by the shim from `a{sv}`) and `org.modulix.Daemon` (writes,
- * polkit-gated on the daemon side).
+ * straight to two D-Bus interfaces served by the `mx-daemon` system daemon:
+ * `org.modulix.Store1` (reads, native `a{sv}`/`aa{sv}` payloads, no JSON
+ * anywhere on the wire or in this process) and `org.modulix.Daemon`
+ * (writes, polkit-gated on the daemon side).
  *
  * Apps map to GsApp as: nix package → desktop app, Modulix module → desktop app
  * (with its plugins attached as ADDON addons), module plugin → ADDON. The
@@ -80,9 +84,10 @@
  *
  * This file is the GObject shell only: type definition, vfunc plumbing and
  * process-wide setup/teardown. The vfunc bodies live next door —
- *   gs-modulix-list.c       list_apps (search / installed / alternate_of)
+ *   gs-modulix-list.c       list_apps (search / installed / alternate_of / for-update)
  *   gs-modulix-refine.c     refine (addons, icons, descriptions, licenses)
  *   gs-modulix-lifecycle.c  install / uninstall (coalescing queue)
+ *   gs-modulix-update.c     refresh_metadata / update_apps (system update)
  */
 
 /**
@@ -99,7 +104,6 @@
 #endif
 
 #include "gs-modulix-enrichment-cache.h"
-#include "gs-modulix-failure-monitor.h"
 #include "gs-modulix-icon-cache.h"
 #include "gs-modulix-icon-resolver.h"
 #include "gs-modulix-icon-theme.h"
@@ -107,8 +111,9 @@
 #include "gs-modulix-list.h"
 #include "gs-modulix-plugins-cache.h"
 #include "gs-modulix-refine.h"
+#include "gs-modulix-update.h"
 
-#include "modulix-store-client.h"
+#include "dbus/gs-modulix-bus.h"
 #include <glib/gi18n-lib.h>
 #include <gnome-software.h>
 
@@ -210,7 +215,7 @@ G_DEFINE_TYPE(GsPluginModulix, gs_plugin_modulix, GS_TYPE_PLUGIN)
  *
  * @pre None beyond `GsPluginClass::setup_async`'s own contract: called at
  *   most once per instance.
- * @post `mx_store_init()` has been attempted; on failure the task carries a
+ * @post `gs_modulix_bus_init()` has been attempted; on failure the task carries a
  *   `GS_PLUGIN_ERROR_FAILED` #GError, which `setup_finish` propagates,
  *   causing GsPluginLoader to disable this plugin for the process's
  *   lifetime. On success, every other vfunc in this file may now assume a
@@ -230,11 +235,11 @@ static void gs_plugin_modulix_setup_async(GsPlugin *plugin,
   gs_modulix_icon_theme_setup();
   gs_modulix_icon_resolver_init();
 
-  gs_modulix_failure_monitor_init();
-
-  if (mx_store_init() != STORE_OK) {
+  g_autoptr(GError) error = NULL;
+  if (!gs_modulix_bus_init(&error)) {
     g_task_return_new_error(task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
-                            "failed to initialise the Modulix backend");
+                            "failed to initialise the Modulix backend: %s",
+                            error->message);
   } else {
     g_task_return_boolean(task, TRUE);
   }
@@ -250,8 +255,8 @@ static void gs_plugin_modulix_setup_async(GsPlugin *plugin,
  * @param result The #GAsyncResult (actually a #GTask) handed to the
  *   `callback` of gs_plugin_modulix_setup_async().
  * @param error Set to a `GS_PLUGIN_ERROR_FAILED` #GError, transfer full to
- *   the caller (who must `g_error_free()` it), if `mx_store_init()` failed;
- *   left untouched on success. Nullable per GLib convention.
+ *   the caller (who must `g_error_free()` it), if `gs_modulix_bus_init()`
+ *   failed; left untouched on success. Nullable per GLib convention.
  *
  * @return `TRUE` if setup succeeded, `FALSE` otherwise (with @p error set).
  *   A `FALSE` return disables this plugin for the rest of the process's
@@ -331,6 +336,51 @@ gs_plugin_modulix_list_apps_finish(GsPlugin *plugin G_GNUC_UNUSED,
 }
 
 /**
+ * @brief Implementation of `GsPluginClass::refresh_metadata_async`: forwards
+ *   to gs_modulix_update_refresh_metadata_async() (gs-modulix-update.c),
+ *   which re-syncs the "Modulix OS" synthetic GsApp's outdated-inputs state.
+ *
+ * @param plugin The #GsPluginModulix instance; forwarded as-is.
+ * @param cache_age_secs Forwarded unchanged; `0` (an explicit user-triggered
+ *   refresh) forces a live `ListOutdatedInputs` re-check instead of serving
+ *   the daemon's 1h cache.
+ * @param flags Unused by this plugin.
+ * @param event_cb Unused by this plugin.
+ * @param event_data Unused by this plugin.
+ * @param cancellable Cancellation token forwarded unchanged; nullable.
+ * @param callback Invoked once the (worker-thread) sync completes.
+ * @param user_data Opaque pointer forwarded unchanged to @p callback.
+ *
+ * @pre gs_plugin_modulix_setup_async() must have completed successfully.
+ * @post The "Modulix OS" GsApp held in the plugin cache reflects the latest
+ *   `ListOutdatedInputs` read. Always succeeds — a failed daemon read is "no
+ *   outdated inputs", not a job failure.
+ */
+static void gs_plugin_modulix_refresh_metadata_async(
+    GsPlugin *plugin, guint64 cache_age_secs,
+    GsPluginRefreshMetadataFlags flags G_GNUC_UNUSED,
+    GsPluginEventCallback event_cb G_GNUC_UNUSED,
+    gpointer event_data G_GNUC_UNUSED, GCancellable *cancellable,
+    GAsyncReadyCallback callback, gpointer user_data) {
+  gs_modulix_update_refresh_metadata_async(
+      plugin, cache_age_secs, cancellable, callback, user_data,
+      gs_plugin_modulix_refresh_metadata_async);
+}
+
+/**
+ * @brief Implementation of `GsPluginClass::refresh_metadata_finish`.
+ *
+ * @param plugin Unused (required by the vfunc signature).
+ * @param result The #GAsyncResult of gs_plugin_modulix_refresh_metadata_async().
+ * @param error Set on failure (cancellation only), transfer full to the caller.
+ * @return TRUE on success, FALSE with @p error set on cancellation.
+ */
+static gboolean gs_plugin_modulix_refresh_metadata_finish(
+    GsPlugin *plugin G_GNUC_UNUSED, GAsyncResult *result, GError **error) {
+  return gs_modulix_update_refresh_metadata_finish(result, error);
+}
+
+/**
  * @brief Implementation of `GsPluginClass::refine_async`: fills in the metadata
  *   GNOME Software is missing, through gs_modulix_refine_async().
  *
@@ -378,6 +428,63 @@ static gboolean gs_plugin_modulix_refine_finish(GsPlugin *plugin G_GNUC_UNUSED,
                                                 GAsyncResult *result,
                                                 GError **error) {
   return gs_modulix_refine_finish(result, error);
+}
+
+/**
+ * @brief Implementation of `GsPluginClass::update_apps_async`: applies the
+ *   Modulix system update, through gs_modulix_update_apps_async()
+ *   (gs-modulix-update.c).
+ *
+ * @param plugin This plugin. Not NULL.
+ * @param list Apps to update; only this plugin's synthetic "Modulix OS" app,
+ *   if present, is acted on.
+ * @param flags Selects `boot` vs `switch` vs no-op; see
+ *   gs_modulix_update_apps_async()'s doc for the exact mapping.
+ * @param progress_cb Called once with `GS_APP_PROGRESS_UNKNOWN` right before
+ *   the daemon call starts — a NixOS rebuild reports no granular progress.
+ * @param progress_data Opaque pointer forwarded to @p progress_cb.
+ * @param event_cb Unused.
+ * @param event_data Unused.
+ * @param action_cb Unused: the polkit prompt is raised by the daemon, not
+ *   through GNOME Software's user-action mechanism.
+ * @param action_data Unused.
+ * @param cancellable Cancellable of the operation, or NULL. It does not abort
+ *   a rebuild the daemon already started.
+ * @param callback Called on completion, or NULL.
+ * @param user_data Data passed to @p callback.
+ * @pre Main thread, daemon connection live.
+ * @post At most one system update runs at a time process-wide; a second
+ *   trigger while one is in flight fails immediately instead of queuing.
+ * @return None.
+ */
+static void gs_plugin_modulix_update_apps_async(
+    GsPlugin *plugin, GsAppList *list,
+    GsPluginUpdateAppsFlags flags,
+    GsPluginProgressCallback progress_cb, gpointer progress_data,
+    GsPluginEventCallback event_cb G_GNUC_UNUSED,
+    gpointer event_data G_GNUC_UNUSED,
+    GsPluginAppNeedsUserActionCallback action_cb G_GNUC_UNUSED,
+    gpointer action_data G_GNUC_UNUSED, GCancellable *cancellable,
+    GAsyncReadyCallback callback, gpointer user_data) {
+  gs_modulix_update_apps_async(plugin, list, flags, progress_cb, progress_data,
+                               cancellable, callback, user_data,
+                               gs_plugin_modulix_update_apps_async);
+}
+
+/**
+ * @brief Implementation of `GsPluginClass::update_apps_finish`.
+ *
+ * @param plugin Unused (required by the vfunc signature).
+ * @param result The #GAsyncResult of gs_plugin_modulix_update_apps_async().
+ * @param error Set on failure, transfer full to the caller.
+ * @return TRUE when the update succeeded or there was nothing of ours to
+ *   update; FALSE with @p error set on a failed `UpdateSystem` call, an
+ *   update already in flight, or cancellation.
+ */
+static gboolean
+gs_plugin_modulix_update_apps_finish(GsPlugin *plugin G_GNUC_UNUSED,
+                                     GAsyncResult *result, GError **error) {
+  return gs_modulix_update_apps_finish(result, error);
 }
 
 /**
@@ -429,9 +536,9 @@ static void gs_plugin_modulix_install_apps_async(
  * @param error Set on failure, transfer full to the caller.
  * @pre Called once, from the async call's callback.
  * @post None.
- * @return TRUE when every app of the batch was installed, or when the batch held
- *   none of this plugin's apps; FALSE with @p error set when the rebuild failed
- *   or authorisation was refused.
+ * @return TRUE when every app of the batch was installed, or when the batch
+ * held none of this plugin's apps; FALSE with @p error set when the rebuild
+ * failed or authorisation was refused.
  */
 static gboolean
 gs_plugin_modulix_install_apps_finish(GsPlugin *plugin G_GNUC_UNUSED,
@@ -440,8 +547,8 @@ gs_plugin_modulix_install_apps_finish(GsPlugin *plugin G_GNUC_UNUSED,
 }
 
 /**
- * @brief Implementation of `GsPluginClass::uninstall_apps_async`: uninstalls the
- *   plugin's apps through the lifecycle queue.
+ * @brief Implementation of `GsPluginClass::uninstall_apps_async`: uninstalls
+ * the plugin's apps through the lifecycle queue.
  *
  * @param plugin This plugin. Not NULL.
  * @param list Apps to uninstall; foreign apps are ignored.
@@ -502,8 +609,8 @@ gs_plugin_modulix_uninstall_apps_finish(GsPlugin *plugin G_GNUC_UNUSED,
  * @post The plugin runs after `appstream` and before `icons` — the latter so a
  *   remote icon added during a refine is still downloaded in the same job. No
  *   `BETTER_THAN` edge is declared: dedup priority stays 0 for packages, which
- *   makes a bare nix package lose against a same-id Flatpak, while modules raise
- *   their own priority per app instead.
+ *   makes a bare nix package lose against a same-id Flatpak, while modules
+ * raise their own priority per app instead.
  * @return None.
  */
 static void gs_plugin_modulix_init(GsPluginModulix *self) {
@@ -522,21 +629,20 @@ static void gs_plugin_modulix_init(GsPluginModulix *self) {
  *   operation is in flight — a running worker holds a plugin ref, so it cannot
  *   race this.
  * @post The store-client connection is shut down and the icon, enrichment and
- *   plugins caches, the icon resolver and the failure monitor are all torn down.
- *   The enrichment and plugins caches destroy their locks here, so the plugin
- *   must not be used again after this; the icon cache deliberately keeps its
- *   lock so a reload within the same process stays safe.
+ *   plugins caches, the icon resolver and the failure monitor are all torn
+ * down. The enrichment and plugins caches destroy their locks here, so the
+ * plugin must not be used again after this; the icon cache deliberately keeps
+ * its lock so a reload within the same process stays safe.
  * @return None.
  */
 static void gs_plugin_modulix_finalize(GObject *object) {
   GsPluginModulix *self = GS_PLUGIN_MODULIX(object);
 
-  mx_store_shutdown();
+  gs_modulix_bus_shutdown();
   gs_modulix_icon_cache_clear();
   gs_modulix_enrichment_cache_clear();
   gs_modulix_plugins_cache_clear();
   gs_modulix_icon_resolver_shutdown();
-  gs_modulix_failure_monitor_shutdown();
   g_clear_pointer(&self->lifecycle, gs_modulix_lifecycle_free);
 
   G_OBJECT_CLASS(gs_plugin_modulix_parent_class)->finalize(object);
@@ -548,9 +654,10 @@ static void gs_plugin_modulix_finalize(GObject *object) {
  *
  * @param klass The class being initialised. Not NULL.
  * @pre Called once by GObject, before the first instance exists.
- * @post The class implements setup, list_apps, refine, install_apps and
- *   uninstall_apps (async plus finish for each). Anything else - upgrades, repo
- *   management, app launching - is left to the other plugins.
+ * @post The class implements setup, list_apps, refresh_metadata, refine,
+ *   update_apps, install_apps and uninstall_apps (async plus finish for
+ *   each). Anything else - repo management, app launching - is left to the
+ *   other plugins.
  * @return None.
  */
 static void gs_plugin_modulix_class_init(GsPluginModulixClass *klass) {
@@ -563,8 +670,12 @@ static void gs_plugin_modulix_class_init(GsPluginModulixClass *klass) {
   plugin_class->setup_finish = gs_plugin_modulix_setup_finish;
   plugin_class->list_apps_async = gs_plugin_modulix_list_apps_async;
   plugin_class->list_apps_finish = gs_plugin_modulix_list_apps_finish;
+  plugin_class->refresh_metadata_async = gs_plugin_modulix_refresh_metadata_async;
+  plugin_class->refresh_metadata_finish = gs_plugin_modulix_refresh_metadata_finish;
   plugin_class->refine_async = gs_plugin_modulix_refine_async;
   plugin_class->refine_finish = gs_plugin_modulix_refine_finish;
+  plugin_class->update_apps_async = gs_plugin_modulix_update_apps_async;
+  plugin_class->update_apps_finish = gs_plugin_modulix_update_apps_finish;
   plugin_class->install_apps_async = gs_plugin_modulix_install_apps_async;
   plugin_class->install_apps_finish = gs_plugin_modulix_install_apps_finish;
   plugin_class->uninstall_apps_async = gs_plugin_modulix_uninstall_apps_async;

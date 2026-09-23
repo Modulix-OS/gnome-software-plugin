@@ -13,7 +13,7 @@
  *
  * Two batched prefetches run before the per-app pass, so the per-app work is
  * pure cache reads:
- *   - enrichment: one `mx_store_get_app_enrichment_many` daemon round-trip
+ *   - enrichment: one batched `GetAppEnrichment` daemon round-trip
  *     for every distinct app-id of the list (see prefetch_enrichment());
  *     an app-id the daemon has no data for is simply absent from the reply,
  *     which is not an error — the per-app step just finds no cache entry
@@ -42,11 +42,9 @@
 #include "gs-modulix-enrichment-cache.h"
 #include "gs-modulix-icon-cache.h"
 #include "gs-modulix-icon-resolver.h"
-#include "gs-modulix-json-utils.h"
 #include "gs-modulix-markup.h"
 
-#include "modulix-store-client.h"
-#include <json-glib/json-glib.h>
+#include "dbus/gs-modulix-store1.h"
 
 /**
  * @brief Per-task state for one gs_modulix_refine_async() invocation,
@@ -66,6 +64,12 @@
  *   case it is allocated in refine_thread() and filled by
  *   prefetch_licenses(); an attribute prefetch_licenses() found no license
  *   for is simply absent as a key, not an error.
+ * @var RefineData::installed_plugins
+ *   Owned `GHashTable` (set semantics: `g_free` key, no value) of
+ *   `"<module>/<name>"` ids currently installed, covering every distinct
+ *   parent module of a plugin (addon) app in RefineData::list. Allocated
+ *   and filled in refine_thread() by prefetch_installed_plugins() whenever
+ *   the list holds at least one plugin app; NULL otherwise.
  */
 typedef struct {
   GsPlugin *plugin; /* borrowed: the task's source object outlives the data */
@@ -74,6 +78,8 @@ typedef struct {
   /* nix attribute (owned) -> SPDX expression (owned), filled by
    * prefetch_licenses() on the details-page refine only. */
   GHashTable *licenses;
+  /* "<module>/<name>" (owned) set, filled by prefetch_installed_plugins(). */
+  GHashTable *installed_plugins;
 } RefineData;
 
 /**
@@ -83,13 +89,14 @@ typedef struct {
  *   is no longer valid.
  * @pre @p d was allocated with `g_new0(RefineData, 1)` and installed as a
  *   `GTask`'s task data (or is otherwise solely owned by the caller).
- * @post @p d->list is unreffed (if non-NULL), @p d->licenses is unreffed
- *   (if non-NULL, freeing every owned key/value it held), and @p d itself
- *   is freed. Nothing is returned.
+ * @post @p d->list is unreffed (if non-NULL), @p d->licenses and
+ *   @p d->installed_plugins are unreffed (if non-NULL, freeing every owned
+ *   key/value they held), and @p d itself is freed. Nothing is returned.
  */
 static void refine_data_free(RefineData *d) {
   g_clear_object(&d->list);
   g_clear_pointer(&d->licenses, g_hash_table_unref);
+  g_clear_pointer(&d->installed_plugins, g_hash_table_unref);
   g_free(d);
 }
 
@@ -106,6 +113,19 @@ static void refine_data_free(RefineData *d) {
  */
 static const gchar *app_id_of(GsApp *app) {
   return g_object_get_data(G_OBJECT(app), "modulix::app_id");
+}
+
+/**
+ * @brief Reads the owning module this plugin stashed on a plugin (addon)
+ * @p app.
+ * @param app The `GsApp` to inspect. Must not be NULL.
+ * @pre None beyond @p app being a valid `GsApp`.
+ * @return (transfer none) (nullable): the module name set as
+ *   `"modulix::parent"` object data, or NULL for an app that is not a
+ *   module-plugin row. Owned by @p app; the caller must not free it.
+ */
+static const gchar *parent_of(GsApp *app) {
+  return g_object_get_data(G_OBJECT(app), "modulix::parent");
 }
 
 /* ── per-app refine steps ───────────────────────────────────────────────── */
@@ -307,16 +327,15 @@ static gboolean refine_license_from_nix(GsApp *app,
  *   reject the lower-quality write anyway and there is no need to pay for
  *   the JSON lookup.
  * @pre None beyond @p app, @p app_id being valid as described above.
- * @post No-op if the cache has no data for @p app_id or the cached JSON
- *   fails to parse. Otherwise: license is set at `GS_APP_QUALITY_NORMAL`
- *   when present and not already @p license_set; description is set at
- *   NORMAL (HTML converted to Pango markup) when present; icon URL, when
- *   present, is always cached via gs_modulix_icon_cache_put() for reuse by
- *   other instances of the same app, but a new `GsRemoteIcon` is only
- *   built and added to @p app itself (gs_app_add_icon() takes its own
- *   reference; the local `g_autoptr` owner still unrefs it afterwards) when
- *   @p app has not already won a themed icon
- *   (`"modulix::icon-themed"` object data unset) — otherwise adding it
+ * @post No-op if the cache has no data for @p app_id. Otherwise: license is
+ *   set at `GS_APP_QUALITY_NORMAL` when present and not already
+ *   @p license_set; description is set at NORMAL (HTML converted to Pango
+ *   markup) when present; icon URL, when present, is always cached via
+ *   gs_modulix_icon_cache_put() for reuse by other instances of the same
+ *   app, but a new `GsRemoteIcon` is only built and added to @p app itself
+ *   (gs_app_add_icon() takes its own reference; the local `g_autoptr` owner
+ *   still unrefs it afterwards) when @p app has not already won a themed
+ *   icon (`"modulix::icon-themed"` object data unset) — otherwise adding it
  *   would let a later-completing download override the themed icon.
  *   Screenshots are added unconditionally via
  *   gs_modulix_add_app_screenshots(). Nothing is returned.
@@ -324,20 +343,16 @@ static gboolean refine_license_from_nix(GsApp *app,
 static void refine_from_enrichment(GsApp *app, const gchar *app_id,
                                    gboolean license_set) {
   gint64 t0 = g_get_monotonic_time();
-  g_autofree gchar *cached = gs_modulix_enrichment_cache_get_or_fetch(app_id);
+  g_autoptr(GVariant) obj = gs_modulix_enrichment_cache_get_or_fetch(app_id);
   g_debug("[modulix] enrichment(%s) %.0fms", app_id,
           (g_get_monotonic_time() - t0) / 1000.0);
-  if (cached == NULL)
-    return;
-
-  g_autoptr(JsonParser) parser = json_parser_new();
-  JsonObject *obj = gs_modulix_json_parse_object(parser, cached, "refine");
   if (obj == NULL)
     return;
 
-  const gchar *html_desc = gs_modulix_json_str(obj, "description");
-  const gchar *icon = gs_modulix_json_str(obj, "icon");
-  const gchar *license = gs_modulix_json_str(obj, "license");
+  const gchar *html_desc = NULL, *icon = NULL, *license = NULL;
+  g_variant_lookup(obj, "description", "&s", &html_desc);
+  g_variant_lookup(obj, "icon", "&s", &icon);
+  g_variant_lookup(obj, "license", "&s", &license);
 
   if (!license_set && license && *license)
     gs_app_set_license(app, GS_APP_QUALITY_NORMAL, license);
@@ -408,10 +423,13 @@ static gboolean want_enrichment(GsPluginRefineRequireFlags flags,
  * @param licenses (nullable): nix attribute → SPDX map from
  *   prefetch_licenses(), forwarded to refine_license_from_nix(); NULL
  *   outside a details-page refine.
+ * @param installed_plugins (nullable): forwarded to refine_plugin() for an
+ *   app whose `modulix::kind` is `"plugin"`.
  * @pre None beyond @p app, @p plugin being valid.
- * @post No-op for an app whose `modulix::kind` is `"plugin"` (addon rows
- *   are refined through their parent, not directly). Otherwise runs addons,
- *   icon, description-seed and license-from-nix unconditionally (each
+ * @post Delegates to refine_plugin() for an app whose `modulix::kind` is
+ *   `"plugin"` (addon rows use a dedicated, smaller refine path — see
+ *   refine_plugin()). Otherwise runs addons, icon, description-seed and
+ *   license-from-nix unconditionally (each
  *   internally gated on its own flag), then calls
  *   refine_from_enrichment() only when want_enrichment() says so AND
  *   @p app has a non-empty app-id — an app with no app-id (no Flathub
@@ -419,12 +437,57 @@ static gboolean want_enrichment(GsPluginRefineRequireFlags flags,
  *   seed_description_from_summary() exists. Nothing is returned; every
  *   step already treats missing data as "leave unset", not as an error.
  */
+/**
+ * @brief Refines a module-plugin (addon) `GsApp`: seeds its icon and
+ * refreshes its installed state from the parent module's currently
+ * installed-plugins set.
+ *
+ * Addon rows built by gs_modulix_add_module_plugins() are already
+ * up-to-date at creation time, but a plugin's addon `GsApp` is also reached
+ * standalone — from the "Installed" page's Add-ons listing
+ * (gs-modulix-list.c's collect_plugins_into()) — where nothing else
+ * refreshes it afterwards. Without this step its state froze at whatever it
+ * was when first built, so a later install/uninstall done from the parent
+ * module's details page, or from the `mx` CLI, never showed up here.
+ *
+ * @param app The plugin (addon) app to refine. Must not be NULL; must have
+ *   `modulix::kind` `"plugin"`.
+ * @param require_flags Caller's `GsPluginRefineRequireFlags`. Only ICON is
+ *   consulted, same rule as refine_icon().
+ * @param installed_plugins (nullable): set of currently installed
+ *   `"<module>/<name>"` ids, from prefetch_installed_plugins(); NULL (or a
+ *   miss) is treated as "not installed" for this app, deferring to
+ *   whatever state @p app already carries under state_is_transient()'s
+ *   guard.
+ * @pre None beyond @p app being valid.
+ * @post @p app's icon is resolved when missing and ICON is requested; its
+ *   state is refreshed unless state_is_transient() says it must be left
+ *   alone. Nothing is returned.
+ */
+static void refine_plugin(GsApp *app, GsPluginRefineRequireFlags require_flags,
+                          GHashTable *installed_plugins) {
+  refine_icon(app, require_flags, NULL);
+
+  const gchar *id = gs_modulix_app_name(app);
+  if (id == NULL || *id == '\0' ||
+      gs_modulix_state_is_transient(gs_app_get_state(app)))
+    return;
+
+  gboolean installed =
+      installed_plugins != NULL && g_hash_table_contains(installed_plugins, id);
+  gs_app_set_state(app,
+                   installed ? GS_APP_STATE_INSTALLED : GS_APP_STATE_AVAILABLE);
+}
+
 static void refine_one(GsApp *app, GsPluginRefineRequireFlags require_flags,
-                       GsPlugin *plugin, GHashTable *licenses) {
+                       GsPlugin *plugin, GHashTable *licenses,
+                       GHashTable *installed_plugins) {
   const gchar *app_id = app_id_of(app);
 
-  if (g_strcmp0(gs_modulix_app_kind(app), "plugin") == 0)
+  if (g_strcmp0(gs_modulix_app_kind(app), "plugin") == 0) {
+    refine_plugin(app, require_flags, installed_plugins);
     return;
+  }
 
   refine_addons(app, require_flags, plugin);
   refine_icon(app, require_flags, app_id);
@@ -504,7 +567,7 @@ static GPtrArray *collect_distinct(GsAppList *list, GsPlugin *plugin,
  * This is the batched round-trip the class-level documentation refers to:
  * it fetches every id at once through
  * gs_modulix_enrichment_cache_prefetch_many(), which itself makes exactly
- * one `mx_store_get_app_enrichment_many` daemon call for the whole list, so
+ * one batched `GetAppEnrichment` daemon call for the whole list, so
  * the per-app gs_modulix_enrichment_cache_get_or_fetch() calls later in
  * refine_from_enrichment() become cache hits (or cached
  * #GS_MODULIX_ENRICHMENT_EMPTY misses) instead of N individual daemon
@@ -549,10 +612,10 @@ static void prefetch_enrichment(GsAppList *list, GsPlugin *plugin) {
  *   `g_free` key/value destroy functions (see refine_thread()).
  * @post Returns early, leaving @p licenses unchanged, when @p list has no
  *   distinct nix package attributes, or when the daemon call
- *   (`mx_store_package_licenses`) or the JSON parse fails — both are
- *   treated as "no licenses available", not as an error surfaced to the
- *   caller. An attribute for which the daemon returned no license (or an
- *   empty one) is simply omitted from @p licenses. Nothing is returned.
+ *   (`GetPackageLicenses`) fails — treated as "no licenses available", not
+ *   as an error surfaced to the caller. An attribute for which the daemon
+ *   returned no license (or an empty one) is simply omitted from
+ *   @p licenses. Nothing is returned.
  */
 static void prefetch_licenses(GsAppList *list, GsPlugin *plugin,
                               GHashTable *licenses) {
@@ -562,25 +625,72 @@ static void prefetch_licenses(GsAppList *list, GsPlugin *plugin,
     return;
 
   gint64 t0 = g_get_monotonic_time();
-  gchar *json =
-      mx_store_package_licenses((const gchar *const *)attrs->pdata, attrs->len);
+  g_autoptr(GVariant) result = gs_modulix_store1_get_package_licenses(
+      (const gchar *const *)attrs->pdata, attrs->len);
   g_debug("[modulix] licenses(n=%u) %.0fms", attrs->len,
           (g_get_monotonic_time() - t0) / 1000.0);
-  if (json == NULL)
+  if (result == NULL)
     return;
 
-  g_autoptr(JsonParser) parser = json_parser_new();
-  JsonObject *obj = gs_modulix_json_parse_object(parser, json, "licenses");
-  mx_store_free_string(json);
-  if (obj == NULL)
-    return;
-
-  g_autoptr(GList) members = json_object_get_members(obj);
-  for (GList *l = members; l != NULL; l = l->next) {
-    const gchar *attr = l->data;
-    const gchar *license = gs_modulix_json_str(obj, attr);
+  GVariantIter iter;
+  g_variant_iter_init(&iter, result);
+  const gchar *attr, *license;
+  while (g_variant_iter_loop(&iter, "{&s&s}", &attr, &license)) {
     if (license != NULL && *license != '\0')
       g_hash_table_insert(licenses, g_strdup(attr), g_strdup(license));
+  }
+}
+
+/**
+ * @brief Fills @p installed_plugins (`"<module>/<name>"` set) for every
+ * distinct parent module of a plugin (addon) app in @p list, in one
+ * `ListInstalledPlugins` daemon call per module.
+ *
+ * No `nix eval` runs on this path (see `ListInstalledPlugins` in
+ * modulix-daemon): each call is a config-derived, 5s-cached lookup.
+ *
+ * @param list The batch being refined. Must not be NULL.
+ * @param plugin The owning `GsPlugin`, forwarded to collect_distinct().
+ * @param installed_plugins (transfer none): destination set, owned by the
+ *   caller (RefineData::installed_plugins); entries are inserted with a
+ *   newly `g_strdup()`ed key, independent of @p list's own strings.
+ * @pre @p installed_plugins is a valid, already-allocated `GHashTable` with
+ *   a `g_free` key destroy function and no value destroy function (see
+ *   refine_thread()).
+ * @post Returns early, leaving @p installed_plugins unchanged, when @p list
+ *   has no plugin app. A module whose daemon call fails simply contributes
+ *   nothing — its plugins are left absent from @p installed_plugins, i.e.
+ *   treated as not installed. Nothing is returned.
+ */
+static void prefetch_installed_plugins(GsAppList *list, GsPlugin *plugin,
+                                       GHashTable *installed_plugins) {
+  g_autoptr(GPtrArray) modules =
+      collect_distinct(list, plugin, "plugin", parent_of);
+  if (modules->len == 0)
+    return;
+
+  for (guint i = 0; i < modules->len; i++) {
+    const gchar *module = g_ptr_array_index(modules, i);
+
+    gint64 t0 = g_get_monotonic_time();
+    g_autoptr(GVariant) array =
+        gs_modulix_store1_list_installed_plugins(module);
+    g_debug("[modulix] list_installed_plugins(%s) %.0fms", module,
+            (g_get_monotonic_time() - t0) / 1000.0);
+    if (array == NULL)
+      continue;
+
+    GVariantIter iter;
+    g_variant_iter_init(&iter, array);
+    GVariant *dict;
+    while ((dict = g_variant_iter_next_value(&iter)) != NULL) {
+      const gchar *name = NULL;
+      g_variant_lookup(dict, "name", "&s", &name);
+      if (name != NULL && *name != '\0')
+        g_hash_table_add(installed_plugins,
+                         g_strdup_printf("%s/%s", module, name));
+      g_variant_unref(dict);
+    }
   }
 }
 
@@ -599,17 +709,20 @@ static void prefetch_licenses(GsAppList *list, GsPlugin *plugin,
  *
  * @param task The GTask to complete. Not NULL.
  * @param source_object Unused.
- * @param task_data_ptr The pass's RefineData: plugin, app list, require flags
- *   and license table. Not NULL.
+ * @param task_data_ptr The pass's RefineData: plugin, app list, require flags,
+ *   license table and installed-plugins set. Not NULL.
  * @param cancellable Cancellable checked before each app, or NULL.
  * @pre Runs on a GTask worker thread, never on the main thread: it blocks on the
  *   daemon.
  * @post Enrichment is prefetched in a single batched round-trip when the
  *   description or the screenshots are wanted. Licenses are prefetched only when
  *   ADDONS is also requested, i.e. only for the details page, since each one
- *   costs a `nix eval` on the daemon. Apps of other plugins are skipped. On
- *   cancellation the task fails with the cancellation error and the apps already
- *   refined keep what they got.
+ *   costs a `nix eval` on the daemon. Installed plugins are prefetched
+ *   unconditionally, one cheap config-derived call per distinct parent module
+ *   of a plugin app in the list (see prefetch_installed_plugins()), so a
+ *   plugin's state stays correct wherever its addon GsApp is refined. Apps of
+ *   other plugins are skipped. On cancellation the task fails with the
+ *   cancellation error and the apps already refined keep what they got.
  * @return None.
  */
 static void refine_thread(GTask *task, gpointer source_object G_GNUC_UNUSED,
@@ -631,6 +744,10 @@ static void refine_thread(GTask *task, gpointer source_object G_GNUC_UNUSED,
     prefetch_licenses(list, data->plugin, data->licenses);
   }
 
+  data->installed_plugins = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                  g_free, NULL);
+  prefetch_installed_plugins(list, data->plugin, data->installed_plugins);
+
   for (guint i = 0; i < gs_app_list_length(list); i++) {
     g_autoptr(GError) err = NULL;
     if (g_cancellable_set_error_if_cancelled(cancellable, &err)) {
@@ -639,7 +756,8 @@ static void refine_thread(GTask *task, gpointer source_object G_GNUC_UNUSED,
     }
     GsApp *app = gs_app_list_index(list, i);
     if (gs_modulix_app_is_ours(app, data->plugin))
-      refine_one(app, data->require_flags, data->plugin, data->licenses);
+      refine_one(app, data->require_flags, data->plugin, data->licenses,
+                data->installed_plugins);
   }
   g_task_return_boolean(task, TRUE);
 }

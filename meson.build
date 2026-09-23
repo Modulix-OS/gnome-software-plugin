@@ -26,12 +26,8 @@ gio_unix_dep       = dependency('gio-unix-2.0')
 gtk4_dep           = dependency('gtk4')
 gdk_pixbuf_dep     = dependency('gdk-pixbuf-2.0')
 appstream_dep      = dependency('appstream', version : '>= 1.0')
-json_glib_dep      = dependency('json-glib-1.0')
 libsoup_dep        = dependency('libsoup-3.0')
 xmlb_dep           = dependency('xmlb')  # gnome-software.h → gs-silo-wrapper.h → <xmlb.h>
-
-cargo    = find_program('cargo')
-cbindgen = find_program('cbindgen')
 
 # Plugin API version (e.g. plugins-23 for GS 49, plugins-24 for GS 50) is read
 # from gnome-software itself so we never hardcode it. Override with -Dplugindir
@@ -44,33 +40,6 @@ if plugindir == ''
   plugindir = get_option('libdir') / 'gnome-software' / plugins_subdir
 endif
 
-# ─── Rust store client: static lib + cbindgen header (one target, two outputs)
-
-store_client_src = meson.current_source_dir() / '..' / 'modulix-store-client'
-cargo_target_dir = meson.current_build_dir() / 'cargo-target'
-
-store_client = custom_target(
-  'modulix-store-client',
-  output             : ['libmodulix_store_client.a', 'modulix-store-client.h'],
-  console            : true,
-  build_by_default   : true,
-  build_always_stale : true,
-  command : [
-    'sh', '-c',
-    'set -e; "@0@" build --release --manifest-path "@1@/Cargo.toml" --target-dir "@2@"; cp "@2@/release/libmodulix_store_client.a" "@OUTPUT0@"; "@3@" --quiet --config "@1@/cbindgen.toml" --crate modulix-store-client --output "@OUTPUT1@" "@1@"'.format(
-      cargo.full_path(), store_client_src, cargo_target_dir, cbindgen.full_path()),
-  ],
-)
-store_client_header = store_client[1]
-
-store_client_dep = declare_dependency(
-  link_args : [
-    '-L' + meson.current_build_dir(),
-    '-lmodulix_store_client',
-    '-lpthread', '-ldl', '-lm',
-  ],
-)
-
 # ─── Plugin ───────────────────────────────────────────────────────────────────
 
 plugin_sources = files(
@@ -80,12 +49,15 @@ plugin_sources = files(
   'plugin/src/gs-modulix-lifecycle.c',
   'plugin/src/gs-modulix-list.c',
   'plugin/src/gs-modulix-refine.c',
+  'plugin/src/gs-modulix-update.c',
   'plugin/src/gs-modulix-enrichment-cache.c',
   'plugin/src/gs-modulix-icon-cache.c',
   'plugin/src/gs-modulix-icon-resolver.c',
   'plugin/src/gs-modulix-plugins-cache.c',
-  'plugin/src/gs-modulix-json-utils.c',
   'plugin/src/gs-modulix-markup.c',
+  'plugin/src/dbus/gs-modulix-bus.c',
+  'plugin/src/dbus/gs-modulix-store1.c',
+  'plugin/src/dbus/gs-modulix-daemon1.c',
 )
 
 modulix_resources = gnome.compile_resources(
@@ -97,7 +69,8 @@ modulix_resources = gnome.compile_resources(
 
 shared_module(
   'gs_plugin_modulix',
-  sources : [plugin_sources, store_client_header, modulix_resources],
+  sources : [plugin_sources, modulix_resources],
+  include_directories : include_directories('plugin/src'),
   dependencies : [
     gnome_software_dep,
     glib_dep,
@@ -107,10 +80,8 @@ shared_module(
     gtk4_dep,
     gdk_pixbuf_dep,
     appstream_dep,
-    json_glib_dep,
     libsoup_dep,
     xmlb_dep,
-    store_client_dep,
   ],
   install     : true,
   install_dir : plugindir,

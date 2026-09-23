@@ -9,19 +9,19 @@ lets Modulix-OS users browse and install **nix packages**, **Modulix modules**
 (meta-packages) and **module plugins** from the Software app.
 
 Everything builds inside the Nix dev shell — the host has no gnome-software
-headers, meson, ninja or cbindgen. Always `nix develop` first.
+headers, meson or ninja. Always `nix develop` first. Pure C: no Rust
+toolchain involved anywhere in this repo.
 
 ## Commands
 
 ```bash
-nix develop                 # enter dev shell (gnome-software, gtk4, cargo, meson, cbindgen, d-spy…)
+nix develop                 # enter dev shell (gnome-software, gtk4, meson, d-spy…)
 
-just build                  # meson + ninja; meson drives cargo + cbindgen for modulix-store-client
+just build                  # meson + ninja
 just install-dev            # install the .so under ~/.local/lib/gnome-software/plugins-<api>/
 just run-gs                 # launch gnome-software (bubblewrap) with the local plugin
 just run-gs-log             # same, filtered logs
 just check-plugin           # assert gs_plugin_query_type is exported
-just test | lint | fmt      # modulix-store-client crate (sibling repo): cargo test / clippy -D warnings / fmt
 nix build .#default         # gnome-software bundled WITH the plugin (single package)
 nix build .#plugin          # just the plugin .so derivation
 ```
@@ -35,47 +35,59 @@ same way.
 
 The daemon (`../modulix-daemon`) is now the sole source of truth for both
 reads and writes — it owns `modulix-core-utils`, the nix package index, and
-every cache. This repo no longer links `modulix-core-utils` at all; it only
-talks to two D-Bus interfaces served by `mx-daemon` (`org.modulix.Daemon`,
-system bus, both at `/org/modulix/Daemon`) through a small Rust+C shim crate,
-`modulix-store-client` (sibling repo `../modulix-store-client`):
+every cache. This repo no longer links `modulix-core-utils` at all, and no
+longer links any Rust code either: it talks directly, in plain C, to two
+D-Bus interfaces served by `mx-daemon` (`org.modulix.Daemon`, system bus,
+both at `/org/modulix/Daemon`), via `plugin/src/dbus/`:
 
 ```
 GNOME Software (user process)
   libgs_plugin_modulix.so   (GsPlugin subclass: gs-plugin-modulix.c = GObject shell,
                              gs-modulix-{list,refine,lifecycle}.c = async vfunc bodies)
-   └── mx_store_* (modulix-store-client.h, C shim over zbus)
-        ├── READ  → org.modulix.Store1  → mx-daemon (unprivileged)
-        └── WRITE → org.modulix.Daemon  → mx-daemon (polkit-gated)
+   └── plugin/src/dbus/ (GDBus/GVariant, no JSON, no Rust)
+        ├── gs-modulix-bus.c     one system-bus GDBusConnection, memoized
+        ├── gs-modulix-store1.c  READ  → org.modulix.Store1  → mx-daemon (unprivileged)
+        └── gs-modulix-daemon1.c WRITE → org.modulix.Daemon  → mx-daemon (polkit-gated)
 ```
 
 - **READ** (search / list installed / module plugins / enrichment / alternate
-  sources) calls `org.modulix.Store1`, typed `a{sv}` on the wire. The shim
-  reshapes each reply into the same JSON string shape this repo's C code has
-  always parsed (json-glib) — JSON is now a shim-internal detail, not the
-  inter-process contract. Free every `mx_store_*` string with
-  `mx_store_free_string`.
+  sources) calls `org.modulix.Store1`, typed `a{sv}`/`aa{sv}`/`a{sa{sv}}`/
+  `a{ss}` on the wire — `gs-modulix-store1.c` hands back the reply's
+  `GVariant` payload unwrapped from its tuple, still typed, never
+  re-serialized to text. Consumers (`gs-modulix-app.c` and friends) read
+  fields with `g_variant_lookup(dict, key, "&s"/"b"/"i"/"u", &out)`, which
+  leaves `out` at its default when the key is absent or the wrong type — the
+  same total-accessor behaviour `gs-modulix-json-utils.c` used to provide,
+  now built into `GVariant` itself. A failed read is logged
+  (`g_warning`) inside `gs-modulix-store1.c` and returned as `NULL`; callers
+  treat `NULL` exactly like an empty result.
 - **WRITE** (install / uninstall) calls `org.modulix.Daemon` directly through
-  the shim — no more hand-rolled `GDBusConnection` call in this repo
-  (`daemon_call()` is gone). polkit authorization happens daemon-side.
-- The shim's blocking zbus API needs no Tokio runtime in the GNOME Software
-  process; `mx_store_init()` opens one system-bus connection, reused by every
-  `mx_store_*` call for the plugin's lifetime.
+  `gs-modulix-daemon1.c` — no shim, no hand-rolled `GDBusConnection` call
+  duplicated per call site. polkit authorization happens daemon-side; unlike
+  the old shim (which collapsed every failure to an undifferentiated `NULL`),
+  a failure now carries a real `GError` (D-Bus error name + message), logged
+  by `gs-modulix-lifecycle.c`'s `call_names()`/`call_plugin()`.
+- `gs_modulix_bus_init()` (`setup_async`) opens one system-bus
+  `GDBusConnection`, reused by every `gs_modulix_bus_call()` for the
+  plugin's lifetime; `GDBusConnection` is thread-safe for method calls, so
+  the list/refine/lifecycle worker threads all share it directly, no Tokio
+  runtime or blocking-bridge needed in the GNOME Software process.
 
 ### Components
 
 | Path | Role |
 |---|---|
-| `plugin/src/gs-plugin-modulix.c` | GObject shell only: type definition, `setup_async` (locale, icon theme, resolver, `mx_store_init`), vfunc plumbing, `gs_plugin_query_type`. |
-| `plugin/src/gs-modulix-list.c` | `list_apps` body: the three query shapes (search / installed / `alternate_of`), one `collect_into()` call per daemon read. |
+| `plugin/src/gs-plugin-modulix.c` | GObject shell only: type definition, `setup_async` (locale, icon theme, resolver, `gs_modulix_bus_init`), vfunc plumbing, `gs_plugin_query_type`. |
+| `plugin/src/gs-modulix-list.c` | `list_apps` body: the four query shapes (search / installed / `alternate_of` / `is_for_update`), one `collect_into()` call per daemon read (the `is_for_update` shape instead delegates to `gs-modulix-update.c`). |
 | `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
-| `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `mx_store_*` write calls. |
+| `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). |
+| `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), synced from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`. See "System updates" below. |
 | `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
 | `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
-| `../modulix-store-client/` | Sibling repo: Rust staticlib (`crate-type = ["staticlib","rlib"]`) wrapping zbus proxies to `org.modulix.{Store1,Daemon}` behind `extern "C"` (`mx_store_*`). No dependency on `modulix-core-utils`. |
-| `../modulix-store-client/cbindgen.toml` | Generates `modulix-store-client.h` (the FFI header) at build time. |
-| `meson.build` | One `custom_target` runs cargo (→ `libmodulix_store_client.a`) **and** cbindgen (→ `modulix-store-client.h`) against the sibling checkout; the plugin links `-lmodulix_store_client`. |
-| `flake.nix` | `packages.plugin`, `packages.default` (= gnome-software + plugin), dev shell + `gnome-software-dev` bubblewrap runner. Vendors `../modulix-store-client` via a flake input for the Nix package build, same pattern `../modulix-core-utils` used to be vendored under. |
+| `plugin/src/dbus/gs-modulix-bus.{c,h}` | The single memoized system-bus `GDBusConnection` (`gs_modulix_bus_init`/`_shutdown`) and the generic synchronous call helper (`gs_modulix_bus_call`) every wrapper below is built on. |
+| `plugin/src/dbus/gs-modulix-store1.{c,h}` | One wrapper per `org.modulix.Store1` read method, each returning the reply's `GVariant` payload (`aa{sv}`/`a{sa{sv}}`/`a{ss}`) unwrapped from its tuple, or `NULL` (logged) on failure. 30s timeout. |
+| `plugin/src/dbus/gs-modulix-daemon1.{c,h}` | `org.modulix.Daemon` write wrappers (`gs_modulix_daemon1_names_call`/`_plugin_call`), returning the daemon's status string or `NULL` with a `GError`. No timeout (`G_MAXINT`) — a rebuild can take minutes. |
+| `flake.nix` | `packages.plugin`, `packages.default` (= gnome-software + plugin), dev shell + `gnome-software-dev` bubblewrap runner. No Rust toolchain, no vendored sibling checkout — the plugin is pure C against `gnome-software`/`glib`/`gtk4`/`appstream`/`libsoup`/`xmlb`. |
 
 ### GsApp mapping & dedup (the non-obvious part)
 
@@ -284,6 +296,55 @@ single unfree term collapses the whole expression to `LicenseRef-proprietary`,
 and a term with no `spdxId` degrades it to `LicenseRef-free` rather than
 emitting a partial `AND` chain.
 
+### System updates
+
+There is no per-app "update" for a nix package or module — installing again
+via the lifecycle queue is how a newer version is picked up. The one thing
+that *is* an update is the NixOS system itself, backed by
+`Store1.ListOutdatedInputs` (read) and `Daemon.UpdateSystem` (write) and
+implemented entirely in `plugin/src/gs-modulix-update.c`.
+
+- **One synthetic `GsApp`** represents the whole system, built/reused via
+  `gs_modulix_update_get_app()` (same plugin-cache "one GsApp per key" rule
+  as `gs-modulix-app.c`, key `"update\x1fmodulix-os"`, id
+  `"org.modulix.ModulixOS"`). `gs_app_set_special_kind(app,
+  GS_APP_SPECIAL_KIND_OS_UPDATE)` is what makes the Updates page render it as
+  the system-update row rather than a regular app; `bundle_kind =
+  AS_BUNDLE_KIND_PACKAGE` is still required or the loader drops it, same as
+  every other Modulix `GsApp`. Object data `modulix::kind = "update"` keeps
+  it out of `gs-modulix-lifecycle.c`'s kind-filtered install/uninstall calls
+  (which only ever match `"package"`/`"module"`/`"plugin"`).
+- **`gs_modulix_update_sync()`** does one `ListOutdatedInputs` read and
+  rewrites the app's dynamic fields every call (state — `UPDATABLE_LIVE` vs
+  `INSTALLED`, guarded by `gs_modulix_state_is_transient()` like every other
+  Modulix app — update-details-text, one line per outdated input, and
+  update-version, the ISO date of the most recently modified input). Used by
+  both `gs_modulix_update_list()` (the `is_for_update` branch of
+  `gs-modulix-list.c`'s `list_apps`, `force_refresh = FALSE`, only appends
+  the app when something is outdated) and `refresh_metadata_async`
+  (`cache_age_secs == 0` → `force_refresh = TRUE`, matching GNOME Software's
+  own "explicit user refresh" contract for that parameter).
+- **Flags → `UpdateSystem` mode**: `NO_DOWNLOAD` and `NO_APPLY` both set →
+  nothing to do (task succeeds immediately). `NO_APPLY` alone → `"boot"`
+  (half the cores, applies on next boot, final state
+  `GS_APP_STATE_PENDING_INSTALL`). Anything else, **including `NO_DOWNLOAD`
+  alone** → `"switch"` (all cores, applies now, final state
+  `GS_APP_STATE_INSTALLED`). The daemon has no way to separate "download" from
+  "apply" (`nix flake update` + `nixos-rebuild` is one transaction), so a
+  download-only request is silently treated as a full update rather than
+  rejected — documented here rather than surfaced as an error, to avoid
+  breaking GNOME Software's offline-update flow.
+- **No progress reporting**: the daemon emits no progress signal, so
+  `update_apps_async` calls `progress_callback` once with
+  `GS_APP_PROGRESS_UNKNOWN` right before the blocking call starts —
+  indeterminate bar, not a bar stuck at 0%.
+- **At most one system update runs at a time**, process-wide: a
+  `G_LOCK`-guarded static flag in `gs-modulix-update.c` (not the per-app
+  coalescing queue `gs-modulix-lifecycle.c` uses for install/uninstall — a
+  system update is a single app, single call, nothing to batch). A second
+  trigger while one is in flight fails immediately with
+  `GS_PLUGIN_ERROR_FAILED` rather than queuing.
+
 ## Contracts (must match the real services)
 
 ### D-Bus — `org.modulix.Daemon`, `org.modulix.Store1` (system bus), in `../modulix-daemon`
@@ -297,13 +358,16 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` (read, unprivileged) | `SearchPackages` / `SearchModules` | `su` (query, max) | `aa{sv}` |
 | `Store1` | `ListInstalledPackages` / `ListInstalledModules` | — | `aa{sv}` |
 | `Store1` | `ListModulePlugins` | `s` (module) | `aa{sv}` |
+| `Store1` | `ListInstalledPlugins` | `s` (module, empty = all) | `aa{sv}` |
 | `Store1` | `GetAppEnrichment` | `as` (app_ids) | `a{sa{sv}}` |
 | `Store1` | `PackagesForAppId` | `s` (app_id) | `aa{sv}` |
 | `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
+| `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache; empty = up to date) |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |
 | `Daemon` | `InstallPlugin` / `UninstallPlugin` | `ss` (module, plugin) | `s` |
+| `Daemon` | `UpdateSystem` | `s` (mode: `"switch"`/`"boot"`) | `s` |
 
 Success = a D-Bus reply with no error. Packages/modules are batched into one
 `as` call each; plugins are called individually. `a{sv}` entry field names
@@ -317,38 +381,43 @@ for exactly which keys it reads. The enrichment entry
 (`GetAppEnrichment`) carries `description?`, `screenshots?`, `icon?`,
 `icon_name?` and `license?` (SPDX expression, or an AppStream
 `LicenseRef-proprietary`/`LicenseRef-free` when only the free/unfree bit is
-known — see `modulix-core-utils::license`).
+known — see `modulix-core-utils::license`). Each `ListOutdatedInputs` row
+carries `input`/`current_rev`/`new_rev` (`s`) and `last_modified` (`t`, Unix
+seconds) — see "System updates" above.
 
-### `modulix-store-client` C ABI — `../modulix-store-client/cbindgen.toml`
+### `plugin/src/dbus/` GVariant wrappers
 
-`mx_store_init`/`mx_store_shutdown`/`mx_store_free_string`; reads
-`mx_store_{search_packages,search_modules,list_installed_packages,
-list_installed_modules,list_module_plugins,get_app_enrichment,
-get_app_enrichment_many,packages_for_app_id,package_licenses}`; writes
-`mx_store_{install,uninstall}_{packages,modules}` (name array + count) and
-`mx_store_{install,uninstall}_plugin` (module, plugin). Every call returns
-`NULL` on failure (connection error, D-Bus error, denied polkit
-authorization) — this repo's code never sees *why* a write failed, only
-whether it did (see `lifecycle_execute` in `gs-modulix-lifecycle.c`).
+`gs_modulix_bus_init`/`_shutdown`/`_call` (`gs-modulix-bus.{c,h}`); reads
+`gs_modulix_store1_{search_packages,search_modules,
+list_installed_packages,list_installed_modules,list_module_plugins,
+list_installed_plugins,get_app_enrichment,packages_for_app_id,
+get_package_licenses,list_outdated_inputs}` (`gs-modulix-store1.{c,h}`;
+`get_app_enrichment` covers both the single-id and batched shapes the old
+shim exposed as two symbols — there is only ever the one D-Bus method;
+`list_outdated_inputs` is the one call with a variable timeout —
+`MODULIX_STORE1_REFRESH_TIMEOUT_MS` instead of the usual 30s when
+`force_refresh` is TRUE); writes `gs_modulix_daemon1_names_call`/
+`_plugin_call`/`_update_system` (`gs-modulix-daemon1.{c,h}`).
+A read returns `NULL` on failure (connection error, D-Bus error) after
+logging its own `g_warning`. A write returns `NULL` **with a `GError`**
+(connection error, D-Bus error, denied polkit authorization) — unlike the
+old shim, this repo's code *can* see why a write failed
+(`lifecycle_execute` in `gs-modulix-lifecycle.c` still only surfaces a
+generic status to GNOME Software, but the detail is logged).
 
 ## Gotchas / current limitations
 
-- **modulix-store-client sibling checkout.** Local `cargo`/`just build` use
-  `../modulix-store-client` directly (its uncommitted changes count). The Nix
-  package build vendors it via the `modulix-store-client` flake input
-  (`git+file://…`, also picking up tracked uncommitted edits); switch that
-  input to the GitHub URL once pushed.
-- **`just build` and the Nix build do not see the same files.** A
-  `git+file://` input exports only files git **tracks at HEAD** — working-tree
-  edits to tracked files are included, but a brand-new file that has never
-  been committed (staging it is not enough) is silently absent. So
-  `just build` can succeed while `nix build .#plugin` fails on a missing
-  symbol or module. Same trap one level up: an input already locked to a clean
-  `rev` is **not** re-resolved from the working tree, so a rebuild keeps
-  serving the committed version. `nix flake update --allow-dirty-locks <input>`
-  turns such an entry into a `dirtyRev` one that is re-read on every eval —
-  that is how the system ended up running a new `mx-daemon` against the old
-  plugin. Verify what actually shipped rather than assuming:
+- **`just build` and `nix build .#plugin` do not see the same files.**
+  `nix build`/`nix flake check` resolve `src = ./.` through git's own
+  filtered source, which only sees files **tracked or staged** — a brand-new
+  file that was never `git add`-ed (even though it's on disk and `just
+  build` compiles it fine) is silently absent from the Nix build, which then
+  fails with a meson "File … does not exist" error, or worse, a stale
+  binary with a missing symbol. Hit this exact trap adding `plugin/src/dbus/`
+  (Partie C, JSON→GVariant migration): `just build` succeeded immediately,
+  `nix build .#plugin` failed until the new files were staged with
+  `git add`. Stage new files (no need to commit) before trusting a Nix
+  build result. Verify what actually shipped rather than assuming:
   `strings …/plugins-23/libgs_plugin_modulix.so | grep -cx 'modulix::kind'`.
 - **The Installed page silently drops any app with a NULL description.**
   `gs_installed_page_is_actual_app()` (`src/gs-installed-page.c`) is the only
@@ -377,8 +446,12 @@ whether it did (see `lifecycle_execute` in `gs-modulix-lifecycle.c`).
   `expand_outputs`/`fetch_outputs`/`expand_with_outputs`). It is table
   lookups + one bounded (500ms) module-index lookup + an optional `nix
   search` for pname-only groups, cached per app-id for 5 minutes daemon-side.
-- Installed **module plugins** are listed as available addons; per-plugin
-  installed state (reading `mx.<name>.plugins`) is not wired yet.
+- Per-plugin installed state (`mx.<module>.plugins`) is wired end to end:
+  stamped by the daemon on both `ListModulePlugins` (per-module catalogue)
+  and `ListInstalledPlugins` (cross-module "Installed" page listing), and
+  refreshed client-side by `gs-modulix-refine.c`'s `refine_plugin()` even
+  when a plugin's addon `GsApp` is reached outside its parent module's
+  details page.
 - `flathub_basic_info.rs` (the generated `NIX_INFO` table, in
   `modulix-core-utils`) must be regenerated after touching `icon_name`/
   `keywords` fields or the Flathub-matching logic: `cargo run --release

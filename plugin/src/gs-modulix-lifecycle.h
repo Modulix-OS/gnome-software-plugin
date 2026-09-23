@@ -5,9 +5,9 @@
  * @brief Public API of the install/uninstall coalescing queue that backs the
  * plugin's `install_apps`/`uninstall_apps` vfuncs.
  *
- * Every operation here ends in one blocking `mx_store_*` call
- * (`modulix-store-client.h`) to `org.modulix.Daemon` over the system bus.
- * That call is a full NixOS rebuild carried out daemon-side: it is
+ * Every operation here ends in one blocking call
+ * (`plugin/src/dbus/gs-modulix-daemon1.h`) to `org.modulix.Daemon` over the
+ * system bus. That call is a full NixOS rebuild carried out daemon-side: it is
  * polkit-gated (the authorisation prompt is raised by the daemon, not this
  * process) and, once authorised, blocks the calling thread for as long as
  * the rebuild takes — commonly minutes. See gs-modulix-lifecycle.c for the
@@ -26,7 +26,7 @@ G_BEGIN_DECLS
 /**
  * @brief Coalescing queue for install/uninstall daemon calls.
  *
- * At most one `mx_store_*` write call is in flight at a time; everything
+ * At most one `org.modulix.Daemon` write call is in flight at a time; everything
  * enqueued (via gs_modulix_lifecycle_install_async() /
  * gs_modulix_lifecycle_uninstall_async()) while a call is running is merged
  * into the next single daemon call for that operation kind, deduplicated by
@@ -70,8 +70,8 @@ void gs_modulix_lifecycle_free(GsModulixLifecycle *self);
  * this is the only progress signal GNOME Software gets: there is no
  * percentage or step reporting during the daemon call itself
  * (`GsPluginProgressCallback` is accepted by the vfunc but never invoked by
- * this queue). The actual install — one coalesced `mx_store_install_packages`
- * / `mx_store_install_modules` / `mx_store_install_plugin` call per app kind,
+ * this queue). The actual install — one coalesced `InstallPackage`
+ * / `InstallModule` / `InstallPlugin` D-Bus call per app kind,
  * batched with whatever else is queued — runs on a private worker thread and
  * blocks it for the whole NixOS rebuild. Authorisation is requested by
  * polkit daemon-side; a refusal is indistinguishable here from any other
@@ -123,8 +123,7 @@ void gs_modulix_lifecycle_install_async(GsModulixLifecycle *self,
  * Mirrors gs_modulix_lifecycle_install_async() exactly, with the opposite
  * states and daemon calls: apps this plugin owns move to
  * %GS_APP_STATE_REMOVING immediately (main thread), the coalesced call uses
- * `mx_store_uninstall_packages` / `mx_store_uninstall_modules` /
- * `mx_store_uninstall_plugin`, and the daemon call is again a full,
+ * `UninstallPackage` / `UninstallModule` / `UninstallPlugin`, and the daemon call is again a full,
  * polkit-gated, blocking NixOS rebuild with no progress reporting. See
  * gs_modulix_lifecycle_install_async() for the full parameter contract,
  * cancellation semantics (an in-flight rebuild cannot be aborted), and error
@@ -159,10 +158,10 @@ void gs_modulix_lifecycle_uninstall_async(GsModulixLifecycle *self,
  * @param result The #GAsyncResult passed to the `GAsyncReadyCallback` given
  * to the matching `*_async` call. Must be the #GTask produced by that call.
  * @param error On failure, set to a %GS_PLUGIN_ERROR / %GS_PLUGIN_ERROR_FAILED
- * error with a generic "Modulix daemon call failed" message — the
- * `mx_store_*` shim collapses every daemon-side failure mode (bus down,
- * D-Bus error, denied polkit authorisation, rebuild/transaction failure) to
- * NULL, so no more specific reason is available here. If @p cancellable was
+ * error with a generic "Modulix daemon call failed" message — GNOME Software
+ * has no richer per-cause UI for this failure, though the actual reason
+ * (D-Bus error, denied polkit authorisation, rebuild/transaction failure) is
+ * now logged by gs-modulix-lifecycle.c's call_names()/call_plugin(). If @p cancellable was
  * cancelled, a %G_IO_ERROR_CANCELLED error is reported instead (via #GTask's
  * default check-cancellable behaviour), even though the underlying daemon
  * call/rebuild was not actually interrupted and may still be running or may
