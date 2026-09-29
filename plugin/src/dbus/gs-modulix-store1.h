@@ -32,6 +32,12 @@ G_BEGIN_DECLS
  *   is too short for. */
 #define MODULIX_STORE1_REFRESH_TIMEOUT_MS 180000
 
+/** @brief Timeout for gs_modulix_store1_check_update(): none. That call runs
+ *   a full `nix flake update` daemon-side, refetching every input, which is
+ *   legitimately minutes — the same reasoning as the write side's
+ *   MODULIX_DAEMON1_NO_TIMEOUT. */
+#define MODULIX_STORE1_CHECK_TIMEOUT_MS G_MAXINT
+
 /**
  * @brief `SearchPackages(s query, u max) -> aa{sv}`.
  * @param query Free-text search terms; treated as `""` if NULL.
@@ -126,5 +132,28 @@ GVariant *gs_modulix_store1_get_package_licenses(const gchar *const *attrs,
  *   failure (bus unreachable, D-Bus error).
  */
 GVariant *gs_modulix_store1_list_outdated_inputs(gboolean force_refresh);
+
+/**
+ * @brief `CheckUpdate() -> b`: whether refreshing every flake input would
+ *   change anything.
+ *
+ * Unlike gs_modulix_store1_list_outdated_inputs(), which only reports, this
+ * call *prepares* the update: the daemon resolves the whole flake into a
+ * candidate `flake.lock`, keeps it in RAM, and the next
+ * gs_modulix_daemon1_update_system() writes that exact lockfile. It also
+ * refills the daemon's outdated-inputs cache from a local diff of the two
+ * lockfiles, so a gs_modulix_store1_list_outdated_inputs() right after is
+ * free and consistent with what an update would apply.
+ *
+ * Blocking and **slow** — a full `nix flake update`, minutes rather than
+ * seconds (see MODULIX_STORE1_CHECK_TIMEOUT_MS). Call it only from a worker
+ * thread, and only on an explicit "look for updates" path; merely displaying
+ * the Updates page must not.
+ *
+ * @return TRUE when an update is available, FALSE when the system is current
+ *   or the call failed (a failure is logged, then reported as "nothing to
+ *   update" — same NULL-is-empty convention as the reads above).
+ */
+gboolean gs_modulix_store1_check_update(void);
 
 G_END_DECLS

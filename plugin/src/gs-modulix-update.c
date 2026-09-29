@@ -55,13 +55,18 @@ GsApp *gs_modulix_update_get_app(GsPlugin *plugin) {
  * @param app The "Modulix OS" GsApp to update. Not NULL.
  * @param array `aa{sv}` reply of `gs_modulix_store1_list_outdated_inputs()`,
  *   or NULL (the read failed — treated as "no outdated inputs"). Borrowed.
+ * @param force_outdated TRUE to mark the system outdated whatever @p array
+ *   holds: `CheckUpdate` is the authoritative answer, and it can legitimately
+ *   report an update whose lockfile diff moved no *direct* input, in which
+ *   case the row list is empty but the update is real.
  * @pre None.
  * @post @p app's state (unless transient), update-details-text and (when at
  *   least one row carried a usable `"input"`) update-version are rewritten.
- * @return TRUE if at least one row was applied (the system is outdated),
- *   FALSE otherwise.
+ * @return TRUE if the system is outdated — at least one row was applied, or
+ *   @p force_outdated was set; FALSE otherwise.
  */
-static gboolean update_app_apply(GsApp *app, GVariant *array) {
+static gboolean update_app_apply(GsApp *app, GVariant *array,
+                                 gboolean force_outdated) {
   g_autoptr(GString) details = g_string_new(NULL);
   guint64 latest = 0;
   gboolean has_updates = FALSE;
@@ -99,6 +104,8 @@ static gboolean update_app_apply(GsApp *app, GVariant *array) {
     }
   }
 
+  has_updates = has_updates || force_outdated;
+
   if (!gs_modulix_state_is_transient(gs_app_get_state(app)))
     gs_app_set_state(app, has_updates ? GS_APP_STATE_UPDATABLE_LIVE
                                       : GS_APP_STATE_INSTALLED);
@@ -117,7 +124,14 @@ gboolean gs_modulix_update_sync(GsPlugin *plugin, gboolean force_refresh) {
   g_autoptr(GVariant) array =
       gs_modulix_store1_list_outdated_inputs(force_refresh);
   g_autoptr(GsApp) app = gs_modulix_update_get_app(plugin);
-  return update_app_apply(app, array);
+  return update_app_apply(app, array, FALSE);
+}
+
+gboolean gs_modulix_update_check(GsPlugin *plugin) {
+  gboolean available = gs_modulix_store1_check_update();
+  g_autoptr(GVariant) array = gs_modulix_store1_list_outdated_inputs(FALSE);
+  g_autoptr(GsApp) app = gs_modulix_update_get_app(plugin);
+  return update_app_apply(app, array, available);
 }
 
 void gs_modulix_update_list(GsPlugin *plugin, GsAppList *list) {
@@ -131,7 +145,6 @@ void gs_modulix_update_list(GsPlugin *plugin, GsAppList *list) {
 
 typedef struct {
   GsPlugin *plugin; /* borrowed: the task's source object outlives this */
-  gboolean force_refresh;
 } RefreshData;
 
 static void refresh_data_free(RefreshData *d) { g_free(d); }
@@ -140,22 +153,19 @@ static void refresh_thread(GTask *task, gpointer source_object G_GNUC_UNUSED,
                            gpointer task_data_ptr,
                            GCancellable *cancellable G_GNUC_UNUSED) {
   RefreshData *d = task_data_ptr;
-  gs_modulix_update_sync(d->plugin, d->force_refresh);
+  gs_modulix_update_check(d->plugin);
   g_task_return_boolean(task, TRUE);
 }
 
-void gs_modulix_update_refresh_metadata_async(GsPlugin *plugin,
-                                              guint64 cache_age_secs,
-                                              GCancellable *cancellable,
-                                              GAsyncReadyCallback callback,
-                                              gpointer user_data,
-                                              gpointer source_tag) {
+void gs_modulix_update_refresh_metadata_async(
+    GsPlugin *plugin, guint64 cache_age_secs G_GNUC_UNUSED,
+    GCancellable *cancellable, GAsyncReadyCallback callback,
+    gpointer user_data, gpointer source_tag) {
   GTask *task = g_task_new(plugin, cancellable, callback, user_data);
   g_task_set_source_tag(task, source_tag);
 
   RefreshData *data = g_new0(RefreshData, 1);
   data->plugin = plugin;
-  data->force_refresh = (cache_age_secs == 0);
 
   g_task_set_task_data(task, data, (GDestroyNotify)refresh_data_free);
   g_task_run_in_thread(task, refresh_thread);

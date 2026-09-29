@@ -6,16 +6,27 @@
  * Modulix has no per-app updates of its own (nix packages and modules are
  * reinstalled, not updated, via the lifecycle queue in gs-modulix-lifecycle.c)
  * — this file covers the one thing that *is* an update: the NixOS system
- * itself, driven by `org.modulix.Store1.ListOutdatedInputs` (read) and
- * `org.modulix.Daemon.UpdateSystem` (write), both documented in CLAUDE.md's
+ * itself, driven by `org.modulix.Store1.CheckUpdate` and
+ * `org.modulix.Store1.ListOutdatedInputs` (reads) and
+ * `org.modulix.Daemon.UpdateSystem` (write), all documented in CLAUDE.md's
  * D-Bus contract table.
+ *
+ * The two reads answer different questions and cost accordingly.
+ * `CheckUpdate` is the *search*: the daemon resolves a whole candidate
+ * `flake.lock` (a full `nix flake update`, minutes) and keeps it in RAM, so
+ * the following `UpdateSystem` applies exactly those revisions instead of
+ * resolving them again. `ListOutdatedInputs` is the *display*: a cached,
+ * row-by-row description of what that candidate changes. Only
+ * gs_modulix_update_check() spends the first; everything else reads the
+ * second.
  *
  * One synthetic GsApp ("org.modulix.ModulixOS", GS_APP_SPECIAL_KIND_OS_UPDATE)
  * represents the whole system: gs_modulix_update_get_app() builds/reuses it
  * from the plugin cache (same "one GsApp per key" rule as gs-modulix-app.c),
  * gs_modulix_update_sync() refreshes its dynamic fields from one
- * ListOutdatedInputs read, gs_modulix_update_list() is what the "is-for-update"
- * branch of gs-modulix-list.c calls, and the async pair below is what
+ * ListOutdatedInputs read, gs_modulix_update_check() does the same after a
+ * live check, gs_modulix_update_list() is what the "is-for-update" branch of
+ * gs-modulix-list.c calls, and the async pair below is what
  * gs-plugin-modulix.c wires onto `GsPluginClass::refresh_metadata_async`/
  * `update_apps_async`.
  */
@@ -81,6 +92,34 @@ GsApp *gs_modulix_update_get_app(GsPlugin *plugin);
 gboolean gs_modulix_update_sync(GsPlugin *plugin, gboolean force_refresh);
 
 /**
+ * @brief Asks the daemon to look for a system update, and refreshes the
+ *   "Modulix OS" GsApp from the answer.
+ *
+ * The "search for updates" path, as opposed to gs_modulix_update_sync()'s
+ * "show what is already known": calls gs_modulix_store1_check_update(), which
+ * resolves a candidate `flake.lock` daemon-side and parks it in RAM for the
+ * next gs_modulix_daemon1_update_system() to write. The row-by-row detail is
+ * then read back with gs_modulix_store1_list_outdated_inputs(), free at that
+ * point since the check just refilled the daemon's cache from a local diff of
+ * the two lockfiles.
+ *
+ * The boolean the check returns wins over the row list when deciding whether
+ * the system is outdated: an update that moved no *direct* input yields an
+ * empty detail list but is still a real update.
+ *
+ * @param plugin GsPlugin forwarded to gs_modulix_update_get_app(). Not NULL.
+ * @pre Blocks the calling thread for a full `nix flake update` daemon-side —
+ *   **minutes**, not milliseconds. Worker thread only, and only on an
+ *   explicit refresh; listing the Updates page must keep using
+ *   gs_modulix_update_sync().
+ * @post The cached "Modulix OS" GsApp's dynamic fields reflect the check, and
+ *   the daemon holds a candidate lockfile iff this returned TRUE.
+ * @return TRUE when an update is available, FALSE when the system is current
+ *   or the check failed (already logged, reported as "nothing to update").
+ */
+gboolean gs_modulix_update_check(GsPlugin *plugin);
+
+/**
  * @brief Appends the "Modulix OS" GsApp to @p list, only when there is
  *   something to update.
  *
@@ -99,25 +138,31 @@ void gs_modulix_update_list(GsPlugin *plugin, GsAppList *list);
 
 /**
  * @brief Implementation of `GsPluginClass::refresh_metadata_async`/`_finish`:
- *   re-syncs the "Modulix OS" GsApp's outdated-inputs state.
+ *   looks for a system update.
+ *
+ * This is GNOME Software's designated "go and check" hook — the Updates
+ * page's Refresh button and gs-update-monitor.c's daily check — so it runs
+ * gs_modulix_update_check(), the one path allowed to spend a full `nix flake
+ * update`. Merely listing the Updates page goes through
+ * gs_modulix_update_list() instead and stays on the daemon's cache.
  *
  * @param plugin The plugin instance. Not NULL.
- * @param cache_age_secs Forwarded by GNOME Software; `0` (an explicit,
- *   user-triggered refresh) maps to `force_refresh = TRUE` in
- *   gs_modulix_update_sync(), matching `ListOutdatedInputs`'s own documented
- *   `force_refresh` contract. Any other value maps to FALSE (serve the
- *   daemon's 1h cache).
+ * @param cache_age_secs Unused: the check is authoritative and always live,
+ *   and no in-tree GNOME Software caller passes the `0` that used to be this
+ *   plugin's "force" marker anyway. The daemon's own cache is what absorbs
+ *   repeated listings.
  * @param cancellable Cancellation token forwarded to the worker task, or
  *   NULL.
- * @param callback Invoked once the (worker-thread) sync completes; result
+ * @param callback Invoked once the (worker-thread) check completes; result
  *   retrievable through gs_modulix_update_refresh_metadata_finish().
  * @param user_data Opaque pointer forwarded unchanged to @p callback.
  * @param source_tag Task source tag (the caller's own vfunc pointer).
  * @pre gs_modulix_bus_init() must have succeeded.
- * @post Runs gs_modulix_update_sync() on a GLib worker-pool thread. Always
- *   completes the task successfully: a failed daemon read is "no outdated
- *   inputs", never a job failure — refreshing metadata has no user-visible
- *   failure mode in this plugin.
+ * @post Runs gs_modulix_update_check() on a GLib worker-pool thread; on
+ *   success the daemon holds a candidate lockfile for the next
+ *   `UpdateSystem`. Always completes the task successfully: a failed daemon
+ *   call is "no update available", never a job failure — refreshing metadata
+ *   has no user-visible failure mode in this plugin.
  * @return None.
  */
 void gs_modulix_update_refresh_metadata_async(GsPlugin *plugin,

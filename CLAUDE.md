@@ -81,7 +81,7 @@ GNOME Software (user process)
 | `plugin/src/gs-modulix-list.c` | `list_apps` body: the four query shapes (search / installed / `alternate_of` / `is_for_update`), one `collect_into()` call per daemon read (the `is_for_update` shape instead delegates to `gs-modulix-update.c`). |
 | `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
 | `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). |
-| `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), synced from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`. See "System updates" below. |
+| `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), checked via `Store1.CheckUpdate`, described from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`. See "System updates" below. |
 | `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
 | `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
 | `plugin/src/dbus/gs-modulix-bus.{c,h}` | The single memoized system-bus `GDBusConnection` (`gs_modulix_bus_init`/`_shutdown`) and the generic synchronous call helper (`gs_modulix_bus_call`) every wrapper below is built on. |
@@ -301,8 +301,20 @@ emitting a partial `AND` chain.
 There is no per-app "update" for a nix package or module — installing again
 via the lifecycle queue is how a newer version is picked up. The one thing
 that *is* an update is the NixOS system itself, backed by
-`Store1.ListOutdatedInputs` (read) and `Daemon.UpdateSystem` (write) and
-implemented entirely in `plugin/src/gs-modulix-update.c`.
+`Store1.CheckUpdate` + `Store1.ListOutdatedInputs` (reads) and
+`Daemon.UpdateSystem` (write), implemented entirely in
+`plugin/src/gs-modulix-update.c`.
+
+**The two reads are not interchangeable.** `CheckUpdate` is the *search*: the
+daemon runs a full `nix flake update --output-lock-file` into a scratch file
+(minutes, refetches every input), keeps the resulting `flake.lock` in RAM
+(`PENDING_LOCK`, no TTL), and refills its own outdated-inputs cache from a
+**local** diff of the old and new lockfiles. `UpdateSystem` then *writes that
+exact lockfile* instead of re-resolving — so the revisions installed are the
+ones the user was shown, and the network cost is paid once.
+`ListOutdatedInputs` is the *display*: cached rows describing that candidate,
+free once a check ran. Only `gs_modulix_update_check()` spends the first;
+`gs_modulix_update_list()` (every visit to the Updates page) reads the second.
 
 - **One synthetic `GsApp`** represents the whole system, built/reused via
   `gs_modulix_update_get_app()` (same plugin-cache "one GsApp per key" rule
@@ -319,21 +331,32 @@ implemented entirely in `plugin/src/gs-modulix-update.c`.
   `INSTALLED`, guarded by `gs_modulix_state_is_transient()` like every other
   Modulix app — update-details-text, one line per outdated input, and
   update-version, the ISO date of the most recently modified input). Used by
-  both `gs_modulix_update_list()` (the `is_for_update` branch of
+  `gs_modulix_update_list()` (the `is_for_update` branch of
   `gs-modulix-list.c`'s `list_apps`, `force_refresh = FALSE`, only appends
-  the app when something is outdated) and `refresh_metadata_async`
-  (`cache_age_secs == 0` → `force_refresh = TRUE`, matching GNOME Software's
-  own "explicit user refresh" contract for that parameter).
+  the app when something is outdated).
+- **`gs_modulix_update_check()`** is the live path, wired to
+  `refresh_metadata_async` — GNOME Software's designated "go and check" hook
+  (Updates-page Refresh button, `gs-update-monitor.c`'s daily check).
+  `CheckUpdate` first, then the same `ListOutdatedInputs` read for the detail
+  rows. **The boolean wins over the rows** when setting the state: a candidate
+  lockfile whose diff moved no *direct* input yields an empty row list but is
+  still a real update, which is why `update_app_apply()` takes a
+  `force_outdated` argument. `cache_age_secs` is now ignored — the old
+  `cache_age_secs == 0 → force_refresh` mapping was dead code, no in-tree
+  GNOME Software caller passes `0`.
 - **Flags → `UpdateSystem` mode**: `NO_DOWNLOAD` and `NO_APPLY` both set →
   nothing to do (task succeeds immediately). `NO_APPLY` alone → `"boot"`
   (half the cores, applies on next boot, final state
   `GS_APP_STATE_PENDING_INSTALL`). Anything else, **including `NO_DOWNLOAD`
   alone** → `"switch"` (all cores, applies now, final state
   `GS_APP_STATE_INSTALLED`). The daemon has no way to separate "download" from
-  "apply" (`nix flake update` + `nixos-rebuild` is one transaction), so a
+  "apply" (writing `flake.lock` + `nixos-rebuild` is one transaction), so a
   download-only request is silently treated as a full update rather than
   rejected — documented here rather than surfaced as an error, to avoid
-  breaking GNOME Software's offline-update flow.
+  breaking GNOME Software's offline-update flow. GNOME Software's *automatic*
+  update path (`download-updates` GSetting, `gs-update-monitor.c`) sends
+  `NO_APPLY` alone, so it lands on `"boot"` and consumes the memoized lockfile
+  like any other trigger.
 - **No progress reporting**: the daemon emits no progress signal, so
   `update_apps_async` calls `progress_callback` once with
   `GS_APP_PROGRESS_UNKNOWN` right before the blocking call starts —
@@ -362,7 +385,8 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` | `GetAppEnrichment` | `as` (app_ids) | `a{sa{sv}}` |
 | `Store1` | `PackagesForAppId` | `s` (app_id) | `aa{sv}` |
 | `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
-| `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache; empty = up to date) |
+| `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache, refilled by `CheckUpdate`; empty = up to date) |
+| `Store1` | `CheckUpdate` | — | `b` (full `nix flake update`, minutes; memoizes the candidate `flake.lock`) |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |
@@ -391,12 +415,16 @@ seconds) — see "System updates" above.
 `gs_modulix_store1_{search_packages,search_modules,
 list_installed_packages,list_installed_modules,list_module_plugins,
 list_installed_plugins,get_app_enrichment,packages_for_app_id,
-get_package_licenses,list_outdated_inputs}` (`gs-modulix-store1.{c,h}`;
+get_package_licenses,list_outdated_inputs,check_update}`
+(`gs-modulix-store1.{c,h}`;
 `get_app_enrichment` covers both the single-id and batched shapes the old
 shim exposed as two symbols — there is only ever the one D-Bus method;
 `list_outdated_inputs` is the one call with a variable timeout —
 `MODULIX_STORE1_REFRESH_TIMEOUT_MS` instead of the usual 30s when
-`force_refresh` is TRUE); writes `gs_modulix_daemon1_names_call`/
+`force_refresh` is TRUE; `check_update` is the one read with **no** timeout
+(`MODULIX_STORE1_CHECK_TIMEOUT_MS = G_MAXINT`, same reasoning as the write
+side) and the one returning a plain `gboolean` rather than a `GVariant`);
+writes `gs_modulix_daemon1_names_call`/
 `_plugin_call`/`_update_system` (`gs-modulix-daemon1.{c,h}`).
 A read returns `NULL` on failure (connection error, D-Bus error) after
 logging its own `g_warning`. A write returns `NULL` **with a `GError`**

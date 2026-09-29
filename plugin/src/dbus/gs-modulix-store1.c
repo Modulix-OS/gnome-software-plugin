@@ -102,3 +102,10 @@ GVariant *gs_modulix_store1_list_outdated_inputs(gboolean force_refresh) {
                      force_refresh ? MODULIX_STORE1_REFRESH_TIMEOUT_MS
                                    : MODULIX_STORE1_TIMEOUT_MS);
 }
+
+gboolean gs_modulix_store1_check_update(void) {
+  g_autoptr(GVariant) reply =
+      store1_call("CheckUpdate", NULL, G_VARIANT_TYPE("(b)"),
+                  MODULIX_STORE1_CHECK_TIMEOUT_MS);
+  return reply != NULL && g_variant_get_boolean(reply);
+}
