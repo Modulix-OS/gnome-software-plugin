@@ -109,3 +109,8 @@ gboolean gs_modulix_store1_check_update(void) {
                   MODULIX_STORE1_CHECK_TIMEOUT_MS);
   return reply != NULL && g_variant_get_boolean(reply);
 }
+
+GVariant *gs_modulix_store1_get_remote_release(void) {
+  return store1_call("GetRemoteRelease", NULL, G_VARIANT_TYPE("(a{sv})"),
+                     MODULIX_STORE1_TIMEOUT_MS);
+}

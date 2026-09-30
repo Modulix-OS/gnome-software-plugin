@@ -483,11 +483,19 @@ static void refine_one(GsApp *app, GsPluginRefineRequireFlags require_flags,
                        GsPlugin *plugin, GHashTable *licenses,
                        GHashTable *installed_plugins) {
   const gchar *app_id = app_id_of(app);
+  const gchar *kind = gs_modulix_app_kind(app);
 
-  if (g_strcmp0(gs_modulix_app_kind(app), "plugin") == 0) {
+  if (g_strcmp0(kind, "plugin") == 0) {
     refine_plugin(app, require_flags, installed_plugins);
     return;
   }
+
+  /* Synthetic rows: the system-update line and the release-upgrade banner.
+   * Both carry everything they need from the start, and the distro-upgrade
+   * job refines its list with REQUIRE_FLAGS_SETUP_ACTION on every visit to
+   * the Updates page. */
+  if (g_strcmp0(kind, "update") == 0 || g_strcmp0(kind, "upgrade") == 0)
+    return;
 
   refine_addons(app, require_flags, plugin);
   refine_icon(app, require_flags, app_id);

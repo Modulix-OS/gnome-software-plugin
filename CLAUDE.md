@@ -82,6 +82,7 @@ GNOME Software (user process)
 | `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
 | `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). |
 | `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), checked via `Store1.CheckUpdate`, described from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`. See "System updates" below. |
+| `plugin/src/gs-modulix-upgrade.c` | `list_distro_upgrades`/`download_upgrade`/`trigger_upgrade` bodies: the `GsUpgradeBanner` row announcing the Modulix release `mxpkgs` publishes (`Store1.GetRemoteRelease`), applied through the same `Daemon.UpdateSystem` as an ordinary update. See "Distro upgrades" below. |
 | `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
 | `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
 | `plugin/src/dbus/gs-modulix-bus.{c,h}` | The single memoized system-bus `GDBusConnection` (`gs_modulix_bus_init`/`_shutdown`) and the generic synchronous call helper (`gs_modulix_bus_call`) every wrapper below is built on. |
@@ -302,8 +303,20 @@ There is no per-app "update" for a nix package or module — installing again
 via the lifecycle queue is how a newer version is picked up. The one thing
 that *is* an update is the NixOS system itself, backed by
 `Store1.CheckUpdate` + `Store1.ListOutdatedInputs` (reads) and
-`Daemon.UpdateSystem` (write), implemented entirely in
-`plugin/src/gs-modulix-update.c`.
+`Daemon.UpdateSystem` (write, three modes: `"build"`/`"boot"`/`"switch"`),
+implemented entirely in `plugin/src/gs-modulix-update.c`.
+
+**GNOME Software applies an update in two successive jobs, and both reach this
+plugin.** `gs-update-monitor.c`'s `get_updates_finished_cb` issues
+`update_apps(NO_APPLY)` ("download"), and its completion callback
+`download_finished_cb` issues `update_apps(…)` a second time to apply — but only
+for apps `_should_auto_update()` still finds in `GS_APP_STATE_UPDATABLE_LIVE`.
+Applying from the *first* job therefore ends the sequence: the app leaves that
+state and the apply job is never issued. That was this plugin's original bug
+(`NO_APPLY → "boot"`): the automatic update rebuilt during the "download" step
+and GNOME Software then only posted a notification. The Updates page's manual
+Download/Update buttons are the same two-step pair
+(`src/gs-updates-section.c:454`, `:496`).
 
 **The two reads are not interchangeable.** `CheckUpdate` is the *search*: the
 daemon runs a full `nix flake update --output-lock-file` into a scratch file
@@ -316,6 +329,32 @@ ones the user was shown, and the network cost is paid once.
 free once a check ran. Only `gs_modulix_update_check()` spends the first;
 `gs_modulix_update_list()` (every visit to the Updates page) reads the second.
 
+`"build"` mode is the one write that does **not** consume that memoized
+lockfile: it reads it with `store::peek_pending_lock()` (daemon side) precisely
+so the `"switch"`/`"boot"` that follows applies the very revisions it just
+built. It is also the one mode that writes nothing at all — no `flake.lock` in
+the config repo, no commit, no activation: `update::build_with_lock()`
+(`modulix-core-utils`) stages a throwaway copy of the config dir carrying the
+candidate lock and runs `nixos-rebuild build` there. Writing the candidate into
+the real repo would move the configuration ahead of the running system, and the
+next `CheckUpdate` would then report "up to date" while the system is still
+behind. `Daemon::run` correspondingly skips its outdated-cache /
+pending-lock / package-index invalidations for `"build"`.
+
+That scratch directory lives under `/tmp`, and `mx-daemon` runs as root, so
+`modulix-daemon.service` now sets `PrivateTmp = true` (in
+`mxpkgs/modulixos/modulix-daemon/default.nix`) — no symlink anyone plants in the
+shared `/tmp` is reachable. `PrivateTmp` alone would have broken more than it
+fixed: `/tmp/mx-build-queue` and `/tmp/mx-skip-rebuild.lock`
+(`modulix-core-utils/src/core/transaction/`) are **cross-process** rendezvous
+between the daemon, the `mx` CLI and `mx-init`, and a private `/tmp` would have
+hidden them from each other, letting two rebuilds run at once. Both are
+therefore re-exposed with `BindPaths`, and pre-created by `systemd.tmpfiles`
+rules so the bind sources always exist (hence the added
+`after = systemd-tmpfiles-setup.service`). `build_with_lock` still creates its
+directory with `create_dir` rather than `create_dir_all`, so the library is safe
+to call from a process without `PrivateTmp` too.
+
 - **One synthetic `GsApp`** represents the whole system, built/reused via
   `gs_modulix_update_get_app()` (same plugin-cache "one GsApp per key" rule
   as `gs-modulix-app.c`, key `"update\x1fmodulix-os"`, id
@@ -323,7 +362,15 @@ free once a check ran. Only `gs_modulix_update_check()` spends the first;
   GS_APP_SPECIAL_KIND_OS_UPDATE)` is what makes the Updates page render it as
   the system-update row rather than a regular app; `bundle_kind =
   AS_BUNDLE_KIND_PACKAGE` is still required or the loader drops it, same as
-  every other Modulix `GsApp`. Object data `modulix::kind = "update"` keeps
+  every other Modulix `GsApp`. `special_kind` is set **before**
+  `gs_app_set_kind(AS_COMPONENT_KIND_OPERATING_SYSTEM)`, not after: the special
+  setter forces the kind to `GENERIC` internally (`lib/gs-app.c`), and
+  `OPERATING_SYSTEM → GENERIC` is a rejected transition, which used to log
+  `Kind change on org.modulix.ModulixOS … is not OK` once per session. The
+  final kind has to be `OPERATING_SYSTEM`, because `gs_app_is_updatable()`
+  returns TRUE unconditionally for it — that is what keeps the row through
+  `filter_updatable_apps` (`lib/gs-plugin-job-list-apps.c`) while it sits in
+  `PENDING_INSTALL`. Object data `modulix::kind = "update"` keeps
   it out of `gs-modulix-lifecycle.c`'s kind-filtered install/uninstall calls
   (which only ever match `"package"`/`"module"`/`"plugin"`).
 - **`gs_modulix_update_sync()`** does one `ListOutdatedInputs` read and
@@ -332,8 +379,45 @@ free once a check ran. Only `gs_modulix_update_check()` spends the first;
   Modulix app — update-details-text, one line per outdated input, and
   update-version, the ISO date of the most recently modified input). Used by
   `gs_modulix_update_list()` (the `is_for_update` branch of
-  `gs-modulix-list.c`'s `list_apps`, `force_refresh = FALSE`, only appends
-  the app when something is outdated).
+  `gs-modulix-list.c`'s `list_apps`, `force_refresh = FALSE`).
+- **`PENDING_INSTALL` + nothing outdated is left untouched entirely.** That
+  state is not transient, yet a finished `"boot"` update owns it *and* the
+  details it left behind, while the daemon's outdated cache is empty by then —
+  so an unconditional rewrite would both drop the state and blank the row that
+  has to offer the restart. A *newly discovered* update does take it over, and
+  has to: staying `PENDING_INSTALL` keeps the app out of
+  `_should_auto_update()`, stranding the new update behind a reboot that only
+  applies the older one.
+- **`GS_APP_QUIRK_NEEDS_REBOOT` tracks `PENDING_INSTALL` exactly**, which is why
+  every state write in `gs-modulix-update.c` goes through `update_set_state()`
+  instead of `gs_app_set_state()`. A stale quirk is not cosmetic:
+  `_get_app_section()` (`src/gs-updates-page.c`) routes any
+  `AS_COMPONENT_KIND_OPERATING_SYSTEM` app carrying it into the *offline*
+  section, and `_button_update_all_clicked_cb()` (`src/gs-updates-section.c`)
+  sets `do_reboot` for that whole section — so a quirk left behind after the
+  pending generation is superseded turns the next interactive "Update" into an
+  unprompted `gs_utils_invoke_reboot_async()`.
+- **The `CheckUpdate` memo expires after 10 minutes**
+  (`MODULIX_CHECK_MEMO_TTL_US`). It only has to bridge one GNOME Software pass —
+  `refresh_metadata` and the `is-for-update` listing `refresh_cache_finished_cb`
+  issues right after, seconds apart. Without an expiry, an update applied
+  *outside* GNOME Software (`nixos-rebuild switch` in a terminal, the normal
+  NixOS workflow) never clears it: every Updates-page visit would force a
+  detail-less row back on, and the automatic monitor would spend a real
+  multi-minute `UpdateSystem` on an update that no longer exists.
+- **The memoized `CheckUpdate` boolean is what `force_outdated` now carries.**
+  `gs_modulix_update_check()` stores its answer in a `G_LOCK`-guarded
+  `last_check_outdated` (cleared once an update is applied), and
+  `gs_modulix_update_sync()` folds it into `update_app_apply()` while it is
+  fresh. So an update whose lockfile diff moved no *direct* input — `diff_locks()`
+  in `modulix-core-utils` walks only the lockfile root's direct inputs, so a
+  candidate that moved a transitive one yields zero rows for a real update — keeps
+  the app `UPDATABLE_LIVE` instead of being declared current on the next page
+  refresh. `gs_modulix_update_list()` appends the app when that returned TRUE,
+  *or* when the app sits in `PENDING_INSTALL` (daemon cache empty by
+  construction, row still has to offer the restart). Returning an empty list
+  here stops the whole automatic chain dead: `get_updates_finished_cb` treats
+  zero apps as "no updates".
 - **`gs_modulix_update_check()`** is the live path, wired to
   `refresh_metadata_async` — GNOME Software's designated "go and check" hook
   (Updates-page Refresh button, `gs-update-monitor.c`'s daily check).
@@ -344,19 +428,29 @@ free once a check ran. Only `gs_modulix_update_check()` spends the first;
   `force_outdated` argument. `cache_age_secs` is now ignored — the old
   `cache_age_secs == 0 → force_refresh` mapping was dead code, no in-tree
   GNOME Software caller passes `0`.
-- **Flags → `UpdateSystem` mode**: `NO_DOWNLOAD` and `NO_APPLY` both set →
-  nothing to do (task succeeds immediately). `NO_APPLY` alone → `"boot"`
-  (half the cores, applies on next boot, final state
-  `GS_APP_STATE_PENDING_INSTALL`). Anything else, **including `NO_DOWNLOAD`
-  alone** → `"switch"` (all cores, applies now, final state
-  `GS_APP_STATE_INSTALLED`). The daemon has no way to separate "download" from
-  "apply" (writing `flake.lock` + `nixos-rebuild` is one transaction), so a
-  download-only request is silently treated as a full update rather than
-  rejected — documented here rather than surfaced as an error, to avoid
-  breaking GNOME Software's offline-update flow. GNOME Software's *automatic*
-  update path (`download-updates` GSetting, `gs-update-monitor.c`) sends
-  `NO_APPLY` alone, so it lands on `"boot"` and consumes the memoized lockfile
-  like any other trigger.
+- **Flags → `UpdateSystem` mode** (`update_mode_for_flags()`):
+
+  | Flags | Mode | Cores | Pre-call state | Final state |
+  |---|---|---|---|---|
+  | `NO_APPLY` (± `INTERACTIVE`) | `"build"` | half | `DOWNLOADING` | `UPDATABLE_LIVE` |
+  | `INTERACTIVE`, no `NO_APPLY` | `"switch"` | all | `INSTALLING` | `INSTALLED` |
+  | neither | `"boot"` | half | `INSTALLING` | `PENDING_INSTALL` (+ `NEEDS_REBOOT`) |
+  | `NO_DOWNLOAD` **and** `NO_APPLY` | — (no-op) | — | untouched | untouched |
+
+  `INTERACTIVE` is the manual/automatic discriminant: every click-driven GNOME
+  Software path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
+  `gs-update-monitor.c` never does. So a user clicking "Update" gets a `switch`
+  on all cores, and the automatic pass gets a `boot` on half of them, leaving the
+  session its share of the machine and surfacing the restart through
+  `GS_APP_QUIRK_NEEDS_REBOOT` (read by `src/gs-updates-page.c`'s
+  `_get_app_section`, `src/gs-updates-section.c` and `src/gs-common.c`).
+
+  Restoring `UPDATABLE_LIVE` after `"build"` is load-bearing, not cosmetic — it
+  is the single thing that lets the apply job be issued at all (see the two-job
+  note above). The `NO_DOWNLOAD | NO_APPLY` no-op branch is unreachable in
+  practice: `lib/gs-plugin-job-update-apps.c` `g_assert`s against that
+  combination. `NO_DOWNLOAD` alone still cannot be honoured as "download only" —
+  it takes the apply path.
 - **No progress reporting**: the daemon emits no progress signal, so
   `update_apps_async` calls `progress_callback` once with
   `GS_APP_PROGRESS_UNKNOWN` right before the blocking call starts —
@@ -367,6 +461,77 @@ free once a check ran. Only `gs_modulix_update_check()` spends the first;
   system update is a single app, single call, nothing to batch). A second
   trigger while one is in flight fails immediately with
   `GS_PLUGIN_ERROR_FAILED` rather than queuing.
+
+### Distro upgrades (the "Modulix OS 0.2 Available" banner)
+
+A Modulix release (`VERSION_ID` 0.1 → 0.2) is **not a mechanism of its own**.
+There is no release ref, no branch and no tag per version: releases ride the
+`main` branch of `mxpkgs` like every other revision, so moving to one is moving
+the flake inputs — exactly what the `is-for-update` row above already does,
+automatically. `plugin/src/gs-modulix-upgrade.c` only adds the *announcement*,
+and its buttons anticipate by hand the very `Daemon.UpdateSystem` calls the
+automatic chain would have made anyway.
+
+- **The source of truth is `mxpkgs/release.json`**, two fields
+  (`version`, `codeName`) whose names are exactly `mx.branding`'s options —
+  `mxpkgs/flake.nix` reads it with `builtins.fromJSON (builtins.readFile
+  ./release.json)`, which is where `/etc/os-release`'s `VERSION_ID` and
+  `VERSION_CODENAME` come from. The daemon reads that same file over HTTPS on
+  the tracked branch (`REMOTE_RELEASE_URL`, `modulix-core-utils/src/lib.rs`)
+  and serves it as `Store1.GetRemoteRelease` (12h cache, empty dict when
+  unknown). Nothing fetched is ever written to disk or evaluated by nix: both
+  fields are validated (`version` ⊂ `[0-9][0-9A-Za-z._-]{0,31}` starting with a
+  digit, `codeName` non-empty, control-character-free, ≤ 64 bytes) then
+  compared and displayed.
+- **`REFS_FOLLOWED` is `"main"`.** It used to be `"master"`, a branch a month
+  behind — which also governs `REMOTE_MODULE_URL`, so the module index served
+  to GNOME Software was stale too.
+- **The comparison is client-side.** `gs_modulix_upgrade_init()`
+  (`setup_async`, main thread) reads `VERSION_ID` once through `GsOsRelease`;
+  the listing keeps the upstream release only when
+  `as_vercmp_simple(remote, current) > 0`. The daemon never decides whether an
+  upgrade applies to this system — it only says what exists.
+- **Flags → mode**, all three vfuncs implemented in `gs-modulix-upgrade.c`:
+
+  | Banner | GNOME Software job | Daemon call | Pre-call state | Final state |
+  |---|---|---|---|---|
+  | display | `list_distro_upgrades_async` | `Store1.GetRemoteRelease` | — | `AVAILABLE` |
+  | "Download" | `download_upgrade_async` | `UpdateSystem("build")` | `DOWNLOADING` | `UPDATABLE` |
+  | "Restart & Upgrade" | `trigger_upgrade_async` | `UpdateSystem("boot")` | `INSTALLING` | `PENDING_INSTALL` |
+
+- **After a successful trigger, GNOME Software reboots by itself**
+  (`gs_utils_invoke_reboot_async()` in `upgrade_trigger_finished_cb`,
+  `src/gs-updates-page.c`). `"boot"` is therefore the only correct mode, and
+  nothing plugin-side or daemon-side may restart anything.
+- **One `GsApp` cannot serve both faces.** `gs_upgrade_banner_refresh()`
+  (`src/gs-upgrade-banner.c`) `g_critical`s on any state outside
+  `{AVAILABLE, QUEUED_FOR_INSTALL, INSTALLING, DOWNLOADING, UPDATABLE,
+  PENDING_INSTALL}` — and `UPDATABLE_LIVE`, where the update row lives, is not
+  among them. So the banner has its own app (plugin-cache key
+  `"upgrade\x1f<version>"`, id `org.modulix.ModulixOS.<version>`), whose state
+  is written **only on creation**: the banner re-lists on every visit to the
+  Updates page, and a fresh `AVAILABLE` would undo a completed download.
+- **Both action vfuncs run on every plugin that implements them** — neither
+  `lib/gs-plugin-job-download-upgrade.c` nor
+  `lib/gs-plugin-job-trigger-upgrade.c` filters by management plugin — so each
+  starts with `upgrade_app_is_ours()` and returns success untouched otherwise.
+- **The listing must never fail.** `gs_plugin_job_list_distro_upgrades`'s
+  `finish_op` discards *every* plugin's contribution as soon as one plugin
+  errors, so an unreachable daemon or an unknown release travels as an empty
+  list. A side effect of merely implementing the vfunc is that the
+  `failed to get upgrades: no plugin could handle listing distro upgrades`
+  warning disappears, empty list or not.
+- **The daemon call is shared with the update row**, hence a shared in-flight
+  flag (`gs_modulix_update_try_acquire()`/`_release()`, exported from
+  `gs-modulix-update.h`) and, after an applied mode, a shared memo retirement
+  (`gs_modulix_update_forget_check()`) so the row stops offering the update the
+  banner just prepared. Daemon-side, a successful `UpdateSystem` also drops the
+  cached release (`store::invalidate_release`) so the banner cannot outlive its
+  own upgrade.
+- **No automation, by design.** `get_upgrades()` (`src/gs-update-monitor.c`,
+  at startup and thrice daily) only ever sends a notification, capped at one a
+  week. Applying a release is either the user clicking the banner, or — far
+  more likely — the ordinary automatic update chain getting there first.
 
 ## Contracts (must match the real services)
 
@@ -387,11 +552,12 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
 | `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache, refilled by `CheckUpdate`; empty = up to date) |
 | `Store1` | `CheckUpdate` | — | `b` (full `nix flake update`, minutes; memoizes the candidate `flake.lock`) |
+| `Store1` | `GetRemoteRelease` | — | `a{sv}` (`version`/`code_name` of the release `mxpkgs` publishes; 12h cache; empty dict = unknown) |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |
 | `Daemon` | `InstallPlugin` / `UninstallPlugin` | `ss` (module, plugin) | `s` |
-| `Daemon` | `UpdateSystem` | `s` (mode: `"switch"`/`"boot"`) | `s` |
+| `Daemon` | `UpdateSystem` | `s` (mode: `"switch"`/`"boot"`/`"build"`) | `s` |
 
 Success = a D-Bus reply with no error. Packages/modules are batched into one
 `as` call each; plugins are called individually. `a{sv}` entry field names
@@ -415,7 +581,7 @@ seconds) — see "System updates" above.
 `gs_modulix_store1_{search_packages,search_modules,
 list_installed_packages,list_installed_modules,list_module_plugins,
 list_installed_plugins,get_app_enrichment,packages_for_app_id,
-get_package_licenses,list_outdated_inputs,check_update}`
+get_package_licenses,list_outdated_inputs,check_update,get_remote_release}`
 (`gs-modulix-store1.{c,h}`;
 `get_app_enrichment` covers both the single-id and batched shapes the old
 shim exposed as two symbols — there is only ever the one D-Bus method;
