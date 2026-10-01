@@ -82,7 +82,6 @@ GNOME Software (user process)
 | `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
 | `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). |
 | `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), checked via `Store1.CheckUpdate`, described from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`. See "System updates" below. |
-| `plugin/src/gs-modulix-upgrade.c` | `list_distro_upgrades`/`download_upgrade`/`trigger_upgrade` bodies: the `GsUpgradeBanner` row announcing the Modulix release `mxpkgs` publishes (`Store1.GetRemoteRelease`), applied through the same `Daemon.UpdateSystem` as an ordinary update. See "Distro upgrades" below. |
 | `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
 | `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
 | `plugin/src/dbus/gs-modulix-bus.{c,h}` | The single memoized system-bus `GDBusConnection` (`gs_modulix_bus_init`/`_shutdown`) and the generic synchronous call helper (`gs_modulix_bus_call`) every wrapper below is built on. |
@@ -306,6 +305,19 @@ that *is* an update is the NixOS system itself, backed by
 `Daemon.UpdateSystem` (write, three modes: `"build"`/`"boot"`/`"switch"`),
 implemented entirely in `plugin/src/gs-modulix-update.c`.
 
+**Modulix is continuous: this row is the only update path there is.** There is
+no major release, no distro upgrade, and deliberately no `GsUpgradeBanner` —
+`VERSION_ID`/`VERSION_CODENAME` (from `mxpkgs/release.json` through
+`mx.branding`) are labels on `/etc/os-release`, not a mechanism. Revisions,
+release-numbered or not, all ride the same tracked branch, so arriving at one
+is moving the flake inputs: exactly what this row does, automatically. A
+previous iteration added a release banner (`gs-modulix-upgrade.c`,
+`Store1.GetRemoteRelease`, `modulix-core-utils::release`); all of it was
+removed rather than kept in sync, and the plugin now implements none of
+`list_distro_upgrades`/`download_upgrade`/`trigger_upgrade` — hence a harmless
+`failed to get upgrades: no plugin could handle listing distro upgrades` in
+GNOME Software's log. Do not reintroduce it.
+
 **GNOME Software applies an update in two successive jobs, and both reach this
 plugin.** `gs-update-monitor.c`'s `get_updates_finished_cb` issues
 `update_apps(NO_APPLY)` ("download"), and its completion callback
@@ -462,77 +474,6 @@ to call from a process without `PrivateTmp` too.
   trigger while one is in flight fails immediately with
   `GS_PLUGIN_ERROR_FAILED` rather than queuing.
 
-### Distro upgrades (the "Modulix OS 0.2 Available" banner)
-
-A Modulix release (`VERSION_ID` 0.1 → 0.2) is **not a mechanism of its own**.
-There is no release ref, no branch and no tag per version: releases ride the
-`main` branch of `mxpkgs` like every other revision, so moving to one is moving
-the flake inputs — exactly what the `is-for-update` row above already does,
-automatically. `plugin/src/gs-modulix-upgrade.c` only adds the *announcement*,
-and its buttons anticipate by hand the very `Daemon.UpdateSystem` calls the
-automatic chain would have made anyway.
-
-- **The source of truth is `mxpkgs/release.json`**, two fields
-  (`version`, `codeName`) whose names are exactly `mx.branding`'s options —
-  `mxpkgs/flake.nix` reads it with `builtins.fromJSON (builtins.readFile
-  ./release.json)`, which is where `/etc/os-release`'s `VERSION_ID` and
-  `VERSION_CODENAME` come from. The daemon reads that same file over HTTPS on
-  the tracked branch (`REMOTE_RELEASE_URL`, `modulix-core-utils/src/lib.rs`)
-  and serves it as `Store1.GetRemoteRelease` (12h cache, empty dict when
-  unknown). Nothing fetched is ever written to disk or evaluated by nix: both
-  fields are validated (`version` ⊂ `[0-9][0-9A-Za-z._-]{0,31}` starting with a
-  digit, `codeName` non-empty, control-character-free, ≤ 64 bytes) then
-  compared and displayed.
-- **`REFS_FOLLOWED` is `"main"`.** It used to be `"master"`, a branch a month
-  behind — which also governs `REMOTE_MODULE_URL`, so the module index served
-  to GNOME Software was stale too.
-- **The comparison is client-side.** `gs_modulix_upgrade_init()`
-  (`setup_async`, main thread) reads `VERSION_ID` once through `GsOsRelease`;
-  the listing keeps the upstream release only when
-  `as_vercmp_simple(remote, current) > 0`. The daemon never decides whether an
-  upgrade applies to this system — it only says what exists.
-- **Flags → mode**, all three vfuncs implemented in `gs-modulix-upgrade.c`:
-
-  | Banner | GNOME Software job | Daemon call | Pre-call state | Final state |
-  |---|---|---|---|---|
-  | display | `list_distro_upgrades_async` | `Store1.GetRemoteRelease` | — | `AVAILABLE` |
-  | "Download" | `download_upgrade_async` | `UpdateSystem("build")` | `DOWNLOADING` | `UPDATABLE` |
-  | "Restart & Upgrade" | `trigger_upgrade_async` | `UpdateSystem("boot")` | `INSTALLING` | `PENDING_INSTALL` |
-
-- **After a successful trigger, GNOME Software reboots by itself**
-  (`gs_utils_invoke_reboot_async()` in `upgrade_trigger_finished_cb`,
-  `src/gs-updates-page.c`). `"boot"` is therefore the only correct mode, and
-  nothing plugin-side or daemon-side may restart anything.
-- **One `GsApp` cannot serve both faces.** `gs_upgrade_banner_refresh()`
-  (`src/gs-upgrade-banner.c`) `g_critical`s on any state outside
-  `{AVAILABLE, QUEUED_FOR_INSTALL, INSTALLING, DOWNLOADING, UPDATABLE,
-  PENDING_INSTALL}` — and `UPDATABLE_LIVE`, where the update row lives, is not
-  among them. So the banner has its own app (plugin-cache key
-  `"upgrade\x1f<version>"`, id `org.modulix.ModulixOS.<version>`), whose state
-  is written **only on creation**: the banner re-lists on every visit to the
-  Updates page, and a fresh `AVAILABLE` would undo a completed download.
-- **Both action vfuncs run on every plugin that implements them** — neither
-  `lib/gs-plugin-job-download-upgrade.c` nor
-  `lib/gs-plugin-job-trigger-upgrade.c` filters by management plugin — so each
-  starts with `upgrade_app_is_ours()` and returns success untouched otherwise.
-- **The listing must never fail.** `gs_plugin_job_list_distro_upgrades`'s
-  `finish_op` discards *every* plugin's contribution as soon as one plugin
-  errors, so an unreachable daemon or an unknown release travels as an empty
-  list. A side effect of merely implementing the vfunc is that the
-  `failed to get upgrades: no plugin could handle listing distro upgrades`
-  warning disappears, empty list or not.
-- **The daemon call is shared with the update row**, hence a shared in-flight
-  flag (`gs_modulix_update_try_acquire()`/`_release()`, exported from
-  `gs-modulix-update.h`) and, after an applied mode, a shared memo retirement
-  (`gs_modulix_update_forget_check()`) so the row stops offering the update the
-  banner just prepared. Daemon-side, a successful `UpdateSystem` also drops the
-  cached release (`store::invalidate_release`) so the banner cannot outlive its
-  own upgrade.
-- **No automation, by design.** `get_upgrades()` (`src/gs-update-monitor.c`,
-  at startup and thrice daily) only ever sends a notification, capped at one a
-  week. Applying a release is either the user clicking the banner, or — far
-  more likely — the ordinary automatic update chain getting there first.
-
 ## Contracts (must match the real services)
 
 ### D-Bus — `org.modulix.Daemon`, `org.modulix.Store1` (system bus), in `../modulix-daemon`
@@ -552,7 +493,6 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
 | `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache, refilled by `CheckUpdate`; empty = up to date) |
 | `Store1` | `CheckUpdate` | — | `b` (full `nix flake update`, minutes; memoizes the candidate `flake.lock`) |
-| `Store1` | `GetRemoteRelease` | — | `a{sv}` (`version`/`code_name` of the release `mxpkgs` publishes; 12h cache; empty dict = unknown) |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |
@@ -581,7 +521,7 @@ seconds) — see "System updates" above.
 `gs_modulix_store1_{search_packages,search_modules,
 list_installed_packages,list_installed_modules,list_module_plugins,
 list_installed_plugins,get_app_enrichment,packages_for_app_id,
-get_package_licenses,list_outdated_inputs,check_update,get_remote_release}`
+get_package_licenses,list_outdated_inputs,check_update}`
 (`gs-modulix-store1.{c,h}`;
 `get_app_enrichment` covers both the single-id and batched shapes the old
 shim exposed as two symbols — there is only ever the one D-Bus method;

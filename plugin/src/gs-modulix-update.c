@@ -214,6 +214,8 @@ static gboolean update_app_apply(GsApp *app, GVariant *array,
   if (!gs_modulix_state_is_transient(state))
     update_set_state(app, has_updates ? GS_APP_STATE_UPDATABLE_LIVE
                                       : GS_APP_STATE_INSTALLED);
+
+
   gs_app_set_update_details_text(app, details->str);
 
   if (latest > 0) {
@@ -312,8 +314,6 @@ void gs_modulix_update_release(void) {
   update_in_flight = FALSE;
   G_UNLOCK(update_lock);
 }
-
-void gs_modulix_update_forget_check(void) { check_memo_set(FALSE); }
 
 /**
  * @brief Maps GNOME Software's update flags onto a `Daemon.UpdateSystem` mode.

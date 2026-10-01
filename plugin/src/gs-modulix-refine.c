@@ -490,11 +490,9 @@ static void refine_one(GsApp *app, GsPluginRefineRequireFlags require_flags,
     return;
   }
 
-  /* Synthetic rows: the system-update line and the release-upgrade banner.
-   * Both carry everything they need from the start, and the distro-upgrade
-   * job refines its list with REQUIRE_FLAGS_SETUP_ACTION on every visit to
-   * the Updates page. */
-  if (g_strcmp0(kind, "update") == 0 || g_strcmp0(kind, "upgrade") == 0)
+  /* The synthetic system-update row carries everything it needs from the
+   * start: nothing here applies to it. */
+  if (g_strcmp0(kind, "update") == 0)
     return;
 
   refine_addons(app, require_flags, plugin);

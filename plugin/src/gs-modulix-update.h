@@ -146,7 +146,9 @@ gboolean gs_modulix_update_sync(GsPlugin *plugin, gboolean force_refresh);
  *   explicit refresh; listing the Updates page must keep using
  *   gs_modulix_update_sync().
  * @post The cached "Modulix OS" GsApp's dynamic fields reflect the check, and
- *   the daemon holds a candidate lockfile iff this returned TRUE.
+ *   the daemon holds a candidate lockfile iff this returned TRUE. A TRUE answer
+ *   also resets the phase to #GS_MODULIX_UPDATE_PHASE_IDLE: the new candidate
+ *   obsoletes whatever a previous `"build"` realised.
  * @return TRUE when an update is available, FALSE when the system is current
  *   or the check failed (already logged, reported as "nothing to update").
  */
@@ -308,9 +310,7 @@ gboolean gs_modulix_update_apps_finish(GAsyncResult *result, GError **error);
  *
  * `Daemon.UpdateSystem` is serialized daemon-side by the build queue, so two
  * concurrent callers would not corrupt anything — they would simply block for
- * minutes each. This flag is what lets the second one fail fast instead, and it
- * is shared with gs-modulix-upgrade.c because the distro-upgrade banner drives
- * the very same call.
+ * minutes each. This flag is what lets the second one fail fast instead.
  *
  * @pre None; safe from any thread.
  * @post On TRUE, the flag is held until gs_modulix_update_release() is called;
@@ -327,20 +327,5 @@ gboolean gs_modulix_update_try_acquire(void);
  * @post Another caller may claim it.
  */
 void gs_modulix_update_release(void);
-
-/**
- * @brief Retires the memoized `Store1.CheckUpdate` answer.
- *
- * Called after an update has been applied through any path — including the
- * distro-upgrade banner (gs-modulix-upgrade.c), which reaches the same
- * `Daemon.UpdateSystem`. Without it the "Modulix OS" update row would keep
- * offering, for the rest of the memo's lifetime, the update that was just
- * prepared.
- *
- * @pre None; safe from any thread.
- * @post The next gs_modulix_update_sync() no longer forces the app outdated on
- *   the memo alone.
- */
-void gs_modulix_update_forget_check(void);
 
 G_END_DECLS

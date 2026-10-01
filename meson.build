@@ -50,7 +50,6 @@ plugin_sources = files(
   'plugin/src/gs-modulix-list.c',
   'plugin/src/gs-modulix-refine.c',
   'plugin/src/gs-modulix-update.c',
-  'plugin/src/gs-modulix-upgrade.c',
   'plugin/src/gs-modulix-enrichment-cache.c',
   'plugin/src/gs-modulix-icon-cache.c',
   'plugin/src/gs-modulix-icon-resolver.c',

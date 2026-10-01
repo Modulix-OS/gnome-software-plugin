@@ -156,27 +156,4 @@ GVariant *gs_modulix_store1_list_outdated_inputs(gboolean force_refresh);
  */
 gboolean gs_modulix_store1_check_update(void);
 
-/**
- * @brief `GetRemoteRelease() -> a{sv}`: the Modulix OS release `mxpkgs`
- *   currently publishes.
- *
- * The dict carries `"version"` (`s`, the string a built system exposes as
- * `VERSION_ID`) and `"code_name"` (`s`) — see `ReleaseEntry` in
- * `modulix-daemon/src/store/entry.rs`. Purely descriptive: it says what
- * exists upstream, never whether this system should move to it. Comparing
- * it with the running version is the caller's job
- * (gs-modulix-upgrade.c).
- *
- * An **empty** dict means the daemon could not read a plausible
- * `release.json`; it is data, not an error, because
- * `gs_plugin_job_list_distro_upgrades` fails every plugin's contribution as
- * soon as one plugin errors.
- *
- * Cheap: answered from a 12h daemon-side cache, one HTTPS request behind it.
- *
- * @return (transfer full) (nullable): the `a{sv}` dict, or NULL on failure
- *   (bus unreachable, D-Bus error).
- */
-GVariant *gs_modulix_store1_get_remote_release(void);
-
 G_END_DECLS

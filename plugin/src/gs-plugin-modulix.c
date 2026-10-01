@@ -112,7 +112,6 @@
 #include "gs-modulix-plugins-cache.h"
 #include "gs-modulix-refine.h"
 #include "gs-modulix-update.h"
-#include "gs-modulix-upgrade.h"
 
 #include "dbus/gs-modulix-bus.h"
 #include <glib/gi18n-lib.h>
@@ -235,7 +234,6 @@ static void gs_plugin_modulix_setup_async(GsPlugin *plugin,
 
   gs_modulix_icon_theme_setup();
   gs_modulix_icon_resolver_init();
-  gs_modulix_upgrade_init();
 
   g_autoptr(GError) error = NULL;
   if (!gs_modulix_bus_init(&error)) {
@@ -603,123 +601,6 @@ gs_plugin_modulix_uninstall_apps_finish(GsPlugin *plugin G_GNUC_UNUSED,
 }
 
 /**
- * @brief Implementation of `GsPluginClass::list_distro_upgrades_async`:
- *   forwards to gs_modulix_upgrade_list_async() (gs-modulix-upgrade.c).
- *
- * @param plugin The Modulix plugin. Not NULL.
- * @param flags GNOME Software's listing flags, forwarded unchanged.
- * @param cancellable Optional #GCancellable.
- * @param callback Called on the calling thread's #GMainContext once done.
- * @param user_data Data for @p callback.
- * @pre gs_plugin_modulix_setup_async() must have completed successfully.
- * @post At most one app is returned, describing the Modulix OS release
- *   `mxpkgs` publishes when it is newer than the running one.
- * @return None.
- */
-static void gs_plugin_modulix_list_distro_upgrades_async(
-    GsPlugin *plugin, GsPluginListDistroUpgradesFlags flags,
-    GCancellable *cancellable, GAsyncReadyCallback callback,
-    gpointer user_data) {
-  gs_modulix_upgrade_list_async(plugin, flags, cancellable, callback, user_data,
-                                gs_plugin_modulix_list_distro_upgrades_async);
-}
-
-/**
- * @brief Implementation of `GsPluginClass::list_distro_upgrades_finish`.
- *
- * @param plugin Unused (required by the vfunc signature).
- * @param result The #GAsyncResult of
- *   gs_plugin_modulix_list_distro_upgrades_async().
- * @param error Set on failure, transfer full to the caller.
- * @return (transfer full): the app list, empty when there is nothing to
- *   announce.
- */
-static GsAppList *gs_plugin_modulix_list_distro_upgrades_finish(
-    GsPlugin *plugin G_GNUC_UNUSED, GAsyncResult *result, GError **error) {
-  return gs_modulix_upgrade_list_finish(result, error);
-}
-
-/**
- * @brief Implementation of `GsPluginClass::download_upgrade_async`: forwards
- *   to gs_modulix_upgrade_download_async() (gs-modulix-upgrade.c).
- *
- * @param plugin The Modulix plugin. Not NULL.
- * @param app App the job targets; left alone unless it is ours.
- * @param flags Download flags, forwarded unchanged.
- * @param event_cb Unused: this path reports through its #GError only.
- * @param event_data Unused.
- * @param cancellable Optional #GCancellable.
- * @param callback Called on the calling thread's #GMainContext once done.
- * @param user_data Data for @p callback.
- * @pre gs_plugin_modulix_setup_async() must have completed successfully.
- * @post The new system closure is realised without being activated.
- * @return None.
- */
-static void gs_plugin_modulix_download_upgrade_async(
-    GsPlugin *plugin, GsApp *app, GsPluginDownloadUpgradeFlags flags,
-    GsPluginEventCallback event_cb G_GNUC_UNUSED,
-    gpointer event_data G_GNUC_UNUSED, GCancellable *cancellable,
-    GAsyncReadyCallback callback, gpointer user_data) {
-  gs_modulix_upgrade_download_async(plugin, app, flags, cancellable, callback,
-                                    user_data,
-                                    gs_plugin_modulix_download_upgrade_async);
-}
-
-/**
- * @brief Implementation of `GsPluginClass::download_upgrade_finish`.
- *
- * @param plugin Unused (required by the vfunc signature).
- * @param result The #GAsyncResult of
- *   gs_plugin_modulix_download_upgrade_async().
- * @param error Set on failure, transfer full to the caller.
- * @return TRUE on success or when the app was not ours, FALSE with @p error
- *   set otherwise.
- */
-static gboolean gs_plugin_modulix_download_upgrade_finish(
-    GsPlugin *plugin G_GNUC_UNUSED, GAsyncResult *result, GError **error) {
-  return gs_modulix_upgrade_download_finish(result, error);
-}
-
-/**
- * @brief Implementation of `GsPluginClass::trigger_upgrade_async`: forwards to
- *   gs_modulix_upgrade_trigger_async() (gs-modulix-upgrade.c).
- *
- * @param plugin The Modulix plugin. Not NULL.
- * @param app App the job targets; left alone unless it is ours.
- * @param flags Trigger flags, forwarded unchanged.
- * @param cancellable Optional #GCancellable.
- * @param callback Called on the calling thread's #GMainContext once done.
- * @param user_data Data for @p callback.
- * @pre gs_plugin_modulix_setup_async() must have completed successfully.
- * @post The new generation is prepared for the next boot; GNOME Software
- *   reboots on its own once this job succeeds.
- * @return None.
- */
-static void gs_plugin_modulix_trigger_upgrade_async(
-    GsPlugin *plugin, GsApp *app, GsPluginTriggerUpgradeFlags flags,
-    GCancellable *cancellable, GAsyncReadyCallback callback,
-    gpointer user_data) {
-  gs_modulix_upgrade_trigger_async(plugin, app, flags, cancellable, callback,
-                                   user_data,
-                                   gs_plugin_modulix_trigger_upgrade_async);
-}
-
-/**
- * @brief Implementation of `GsPluginClass::trigger_upgrade_finish`.
- *
- * @param plugin Unused (required by the vfunc signature).
- * @param result The #GAsyncResult of
- *   gs_plugin_modulix_trigger_upgrade_async().
- * @param error Set on failure, transfer full to the caller.
- * @return TRUE on success or when the app was not ours, FALSE with @p error
- *   set otherwise.
- */
-static gboolean gs_plugin_modulix_trigger_upgrade_finish(
-    GsPlugin *plugin G_GNUC_UNUSED, GAsyncResult *result, GError **error) {
-  return gs_modulix_upgrade_trigger_finish(result, error);
-}
-
-/**
  * @brief GObject `init`: builds the lifecycle queue and declares the plugin's
  *   ordering rules.
  *
@@ -774,10 +655,9 @@ static void gs_plugin_modulix_finalize(GObject *object) {
  * @param klass The class being initialised. Not NULL.
  * @pre Called once by GObject, before the first instance exists.
  * @post The class implements setup, list_apps, refresh_metadata, refine,
- *   update_apps, install_apps, uninstall_apps, list_distro_upgrades,
- *   download_upgrade and trigger_upgrade (async plus finish for each).
- *   Anything else - repo management, app launching - is left to the other
- *   plugins.
+ *   update_apps, install_apps and uninstall_apps (async plus finish for each).
+ *   Anything else - repo management, app launching, distro upgrades - is left
+ *   to the other plugins.
  * @return None.
  */
 static void gs_plugin_modulix_class_init(GsPluginModulixClass *klass) {
@@ -800,15 +680,6 @@ static void gs_plugin_modulix_class_init(GsPluginModulixClass *klass) {
   plugin_class->install_apps_finish = gs_plugin_modulix_install_apps_finish;
   plugin_class->uninstall_apps_async = gs_plugin_modulix_uninstall_apps_async;
   plugin_class->uninstall_apps_finish = gs_plugin_modulix_uninstall_apps_finish;
-  plugin_class->list_distro_upgrades_async =
-      gs_plugin_modulix_list_distro_upgrades_async;
-  plugin_class->list_distro_upgrades_finish =
-      gs_plugin_modulix_list_distro_upgrades_finish;
-  plugin_class->download_upgrade_async = gs_plugin_modulix_download_upgrade_async;
-  plugin_class->download_upgrade_finish =
-      gs_plugin_modulix_download_upgrade_finish;
-  plugin_class->trigger_upgrade_async = gs_plugin_modulix_trigger_upgrade_async;
-  plugin_class->trigger_upgrade_finish = gs_plugin_modulix_trigger_upgrade_finish;
 }
 
 /**
