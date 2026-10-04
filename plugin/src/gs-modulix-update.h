@@ -30,13 +30,14 @@
  * gs-plugin-modulix.c wires onto `GsPluginClass::refresh_metadata_async`/
  * `update_apps_async`.
  *
- * `UpdateSystem` has three modes and GNOME Software drives all three: it applies
- * an update in two successive jobs, a `NO_APPLY` "download" then an apply, and
- * the second one is only issued if the app is still
- * `GS_APP_STATE_UPDATABLE_LIVE` when the first finishes. So `NO_APPLY` maps to
- * `"build"` (realise the closure, activate nothing, keep the state), and the
- * apply job maps to `"switch"` or `"boot"` depending on `INTERACTIVE` — see
- * gs_modulix_update_apps_async() for the full table.
+ * GNOME Software applies an update in two successive jobs, a `NO_APPLY`
+ * "download" then an apply, and the second one is only issued if the app is
+ * still `GS_APP_STATE_UPDATABLE_LIVE` when the first finishes. That split is the
+ * only thing the mode depends on: `NO_APPLY` maps to `"build"` (realise the
+ * closure, activate nothing, keep the state), the apply job maps to `"boot"`.
+ * `"switch"` is never requested from here any more — a click in the Updates page
+ * now gets exactly the automatic behaviour, see update_mode_for_flags()
+ * (`gs-modulix-update.c`) for why.
  */
 #pragma once
 
@@ -236,11 +237,11 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
  *
  * Flag mapping (see CLAUDE.md "System updates"): `NO_APPLY` →
  * `UpdateSystem("build")`, which realises the new closure and activates
- * nothing, leaving the app `GS_APP_STATE_UPDATABLE_LIVE`; otherwise
- * `INTERACTIVE` (set by every click-driven GNOME Software path, never by
- * gs-update-monitor.c) selects `UpdateSystem("switch")`, final state
- * `GS_APP_STATE_INSTALLED`, and its absence selects `UpdateSystem("boot")`,
- * final state `GS_APP_STATE_PENDING_INSTALL` plus `GS_APP_QUIRK_NEEDS_REBOOT`.
+ * nothing, leaving the app `GS_APP_STATE_UPDATABLE_LIVE`; anything else →
+ * `UpdateSystem("boot")`, final state `GS_APP_STATE_PENDING_INSTALL` plus
+ * `GS_APP_QUIRK_NEEDS_REBOOT`. `INTERACTIVE` is not read: a user clicking the
+ * "Modulix OS" row gets the same `"boot"` the update monitor would have asked
+ * for, never the old `UpdateSystem("switch")` (see update_mode_for_flags()).
  * `NO_DOWNLOAD` and `NO_APPLY` both set → task succeeds immediately, nothing to
  * do (unreachable in practice: gs-plugin-job-update-apps.c asserts against that
  * combination). `NO_DOWNLOAD` alone cannot be honoured — the daemon does not
@@ -261,8 +262,7 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
  * @param plugin The plugin instance. Not NULL.
  * @param list Apps to update; only this plugin's "Modulix OS" app (if
  *   present) is acted on.
- * @param flags Selects `build` vs `switch` vs `boot` vs no-op, per the mapping
- *   above.
+ * @param flags Selects `build` vs `boot` vs no-op, per the mapping above.
  * @param progress_cb Called once with `GS_APP_PROGRESS_UNKNOWN` right before
  *   the daemon call starts (the daemon reports no granular progress). May be
  *   NULL.
@@ -274,11 +274,8 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
  * @param user_data Opaque pointer forwarded unchanged to @p callback.
  * @param source_tag Task source tag (the caller's own vfunc pointer).
  * @pre Main thread, daemon connection live.
- * @post On success: the app's state reflects the outcome, and for `"switch"`
- *   its update-details/-version are cleared (the daemon's own cache is already
- *   invalidated, see `invalidate_updates()`,
- *   `modulix-daemon/src/daemon/mod.rs` — which deliberately skips `"build"`).
- *   `"build"` and `"boot"` keep them: they still describe, respectively, what
+ * @post On success: the app's state reflects the outcome, and its
+ *   update-details/-version are kept — they still describe, respectively, what
  *   the pending apply and the next boot will activate. On failure: the app
  *   reverts to
  *   `GS_APP_STATE_UPDATABLE_LIVE` and the task carries a

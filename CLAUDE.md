@@ -302,7 +302,8 @@ There is no per-app "update" for a nix package or module — installing again
 via the lifecycle queue is how a newer version is picked up. The one thing
 that *is* an update is the NixOS system itself, backed by
 `Store1.CheckUpdate` + `Store1.ListOutdatedInputs` (reads) and
-`Daemon.UpdateSystem` (write, three modes: `"build"`/`"boot"`/`"switch"`),
+`Daemon.UpdateSystem` (write; the daemon serves `"build"`/`"boot"`/`"switch"`,
+this plugin only ever asks for the first two — see the flags table below),
 implemented entirely in `plugin/src/gs-modulix-update.c`.
 
 **Modulix is continuous: this row is the only update path there is.** There is
@@ -343,8 +344,8 @@ free once a check ran. Only `gs_modulix_update_check()` spends the first;
 
 `"build"` mode is the one write that does **not** consume that memoized
 lockfile: it reads it with `store::peek_pending_lock()` (daemon side) precisely
-so the `"switch"`/`"boot"` that follows applies the very revisions it just
-built. It is also the one mode that writes nothing at all — no `flake.lock` in
+so the `"boot"` that follows applies the very revisions it just built. It is
+also the one mode that writes nothing at all — no `flake.lock` in
 the config repo, no commit, no activation: `update::build_with_lock()`
 (`modulix-core-utils`) stages a throwaway copy of the config dir carrying the
 candidate lock and runs `nixos-rebuild build` there. Writing the candidate into
@@ -445,17 +446,33 @@ to call from a process without `PrivateTmp` too.
   | Flags | Mode | Cores | Pre-call state | Final state |
   |---|---|---|---|---|
   | `NO_APPLY` (± `INTERACTIVE`) | `"build"` | half | `DOWNLOADING` | `UPDATABLE_LIVE` |
-  | `INTERACTIVE`, no `NO_APPLY` | `"switch"` | all | `INSTALLING` | `INSTALLED` |
-  | neither | `"boot"` | half | `INSTALLING` | `PENDING_INSTALL` (+ `NEEDS_REBOOT`) |
+  | anything else (click **or** monitor) | `"boot"` | half | `INSTALLING` | `PENDING_INSTALL` (+ `NEEDS_REBOOT`) |
   | `NO_DOWNLOAD` **and** `NO_APPLY` | — (no-op) | — | untouched | untouched |
 
-  `INTERACTIVE` is the manual/automatic discriminant: every click-driven GNOME
-  Software path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
-  `gs-update-monitor.c` never does. So a user clicking "Update" gets a `switch`
-  on all cores, and the automatic pass gets a `boot` on half of them, leaving the
-  session its share of the machine and surfacing the restart through
-  `GS_APP_QUIRK_NEEDS_REBOOT` (read by `src/gs-updates-page.c`'s
-  `_get_app_section`, `src/gs-updates-section.c` and `src/gs-common.c`).
+  **`INTERACTIVE` is deliberately not read: there is one apply behaviour, the
+  automatic one.** It *is* GNOME Software's manual/automatic discriminant —
+  every click-driven path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
+  `gs-update-monitor.c` never does — and this plugin used to map it to
+  `UpdateSystem("switch")`: a `nixos-rebuild switch` on every core, activated in
+  the middle of the running session. A click now gets the same `"boot"` on half
+  the cores the monitor would have asked for, leaving the session its share of
+  the machine and surfacing the restart through `GS_APP_QUIRK_NEEDS_REBOOT`
+  (read by `src/gs-updates-page.c`'s `_get_app_section`,
+  `src/gs-updates-section.c` and `src/gs-common.c`). `"switch"` is now only
+  reachable from the `mx` CLI.
+
+  The row itself **stays** on the Updates page. Hiding it (it is listable only
+  for the monitor: `src/gs-updates-page.c:670` passes
+  `GS_PLUGIN_LIST_APPS_FLAGS_INTERACTIVE` where `src/gs-update-monitor.c:849`
+  passes `FLAGS_NONE`, and `lib/gs-plugin-job-list-apps.c:304` forwards the flag
+  to the vfunc) was considered and rejected: with GNOME Software's own automatic
+  updates switched off (GSettings `download-updates`, `should_download_updates()`
+  in `src/gs-update-monitor.c`) that row is the only remaining way to update at
+  all. Note there is no middle ground — an `AS_COMPONENT_KIND_OPERATING_SYSTEM`
+  app cannot be shown without a clickable action: `_get_app_section()` always
+  lands it in `ONLINE` or `OFFLINE`, and `_update_buttons()`
+  (`src/gs-updates-section.c`) renders those sections' button unconditionally,
+  never looking at quirks.
 
   Restoring `UPDATABLE_LIVE` after `"build"` is load-bearing, not cosmetic — it
   is the single thing that lets the apply job be issued at all (see the two-job

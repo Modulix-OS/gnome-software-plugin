@@ -321,22 +321,32 @@ void gs_modulix_update_release(void) {
  * GNOME Software applies an update in two jobs: a `NO_APPLY` one ("download"),
  * then — only if the app is still `GS_APP_STATE_UPDATABLE_LIVE` when the first
  * finishes (`_should_auto_update()` in `src/gs-update-monitor.c`) — a second one
- * that applies. `INTERACTIVE` tells the two triggers apart: every click-driven
- * path sets it (`src/gs-updates-section.c`, `src/gs-page.c`), the update monitor
- * never does.
+ * that applies. Which of those two the call is, is the only thing that matters
+ * here.
+ *
+ * `INTERACTIVE` is deliberately **not** read. It is GNOME Software's
+ * manual/automatic discriminant — every click-driven path sets it
+ * (`src/gs-updates-section.c`, `src/gs-page.c`), `gs-update-monitor.c` never
+ * does — and this plugin used to turn it into `UpdateSystem("switch")`: a
+ * `nixos-rebuild switch` on every core, activated in the middle of the running
+ * session. There is now one single apply behaviour, the automatic one, whoever
+ * asked for it. The "Modulix OS" row stays on the Updates page precisely so an
+ * update remains reachable when GNOME Software's own automatic updates are
+ * switched off (GSettings `download-updates`, read by
+ * `should_download_updates()` in `src/gs-update-monitor.c`); it simply no longer
+ * does anything the monitor would not have done.
  *
  * @param flags Flags the vfunc was called with.
  * @pre None.
  * @post None (pure function).
  * @return `"build"` when `NO_APPLY` is set (realise the closure, activate
- *   nothing), `"switch"` for an interactive apply (now, all cores), `"boot"`
- *   for an automatic one (next boot, half the cores). Never NULL.
+ *   nothing), `"boot"` otherwise (activate at the next boot, half the cores).
+ *   Never NULL, and never `"switch"` — the daemon still serves that mode, for
+ *   the `mx` CLI.
  */
 static const gchar *update_mode_for_flags(GsPluginUpdateAppsFlags flags) {
   if (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY)
     return "build";
-  if (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE)
-    return "switch";
   return "boot";
 }
 
@@ -347,23 +357,22 @@ static const gchar *update_mode_for_flags(GsPluginUpdateAppsFlags flags) {
  * @param plugin Unused (kept for symmetry with the rest of the plugin's
  *   internal APIs; the daemon call needs no plugin-specific context).
  * @param app The "Modulix OS" GsApp being updated. Not NULL. Mutated: state
- *   and, when the update was applied, update-details/-version and the
- *   `GS_APP_QUIRK_NEEDS_REBOOT` quirk.
+ *   and, when the update was applied, the `GS_APP_QUIRK_NEEDS_REBOOT` quirk.
  * @param flags Selects the mode, see update_mode_for_flags().
  * @param error Set to a generic `GS_PLUGIN_ERROR_FAILED` on failure; the
  *   daemon's real `GError` is logged here, not propagated further (same
  *   convention as gs-modulix-lifecycle.c's call_names()).
  * @pre Called off the main thread: `UpdateSystem` blocks for the whole
  *   rebuild.
- * @post On success: `"build"` restores `GS_APP_STATE_UPDATABLE_LIVE` and keeps
- *   update-details/-version (nothing was applied, and that state is what lets
- *   GNOME Software issue the apply job that follows); `"boot"` lands on
- *   `GS_APP_STATE_PENDING_INSTALL` with `GS_APP_QUIRK_NEEDS_REBOOT` added and
- *   the details kept (they describe what the next boot will activate);
- *   `"switch"` lands on `GS_APP_STATE_INSTALLED` with the details cleared.
+ * @post On success: `"build"` restores `GS_APP_STATE_UPDATABLE_LIVE` (nothing
+ *   was applied, and that state is what lets GNOME Software issue the apply job
+ *   that follows); `"boot"` retires the `CheckUpdate` memo and lands on
+ *   `GS_APP_STATE_PENDING_INSTALL` with `GS_APP_QUIRK_NEEDS_REBOOT` added.
+ *   Either way the update-details/-version are kept: they describe what the
+ *   pending apply, respectively the next boot, will activate.
  *   `GS_APP_QUIRK_NEEDS_REBOOT` tracks `PENDING_INSTALL` exactly, through
- *   update_set_state(). Either applied mode retires the `CheckUpdate` memo. On
- *   failure, @p app reverts to `GS_APP_STATE_UPDATABLE_LIVE`.
+ *   update_set_state(). On failure, @p app reverts to
+ *   `GS_APP_STATE_UPDATABLE_LIVE`.
  * @return TRUE on success, FALSE with @p error set otherwise.
  */
 static gboolean gs_modulix_update_run(GsPlugin *plugin G_GNUC_UNUSED,
@@ -394,15 +403,7 @@ static gboolean gs_modulix_update_run(GsPlugin *plugin G_GNUC_UNUSED,
   }
 
   check_memo_set(FALSE);
-
-  if (g_strcmp0(mode, "boot") == 0) {
-    update_set_state(app, GS_APP_STATE_PENDING_INSTALL);
-    return TRUE;
-  }
-
-  update_set_state(app, GS_APP_STATE_INSTALLED);
-  gs_app_set_update_details_text(app, NULL);
-  gs_app_set_update_version(app, NULL);
+  update_set_state(app, GS_APP_STATE_PENDING_INSTALL);
   return TRUE;
 }
 
