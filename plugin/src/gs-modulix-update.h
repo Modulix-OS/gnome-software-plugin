@@ -6,12 +6,13 @@
  * Modulix has no per-app updates of its own (nix packages and modules are
  * reinstalled, not updated, via the lifecycle queue in gs-modulix-lifecycle.c)
  * — this file covers the one thing that *is* an update: the NixOS system
- * itself, driven by `org.modulix.Store1.CheckUpdate` and
- * `org.modulix.Store1.ListOutdatedInputs` (reads) and
+ * itself, driven by `org.modulix.Store1.CheckUpdate`,
+ * `org.modulix.Store1.ListOutdatedInputs` and
+ * `org.modulix.Store1.RebootRequired` (reads) and
  * `org.modulix.Daemon.UpdateSystem` (write), all documented in CLAUDE.md's
  * D-Bus contract table.
  *
- * The two reads answer different questions and cost accordingly.
+ * The first two reads answer different questions and cost accordingly.
  * `CheckUpdate` is the *search*: the daemon resolves a whole candidate
  * `flake.lock` (a full `nix flake update`, minutes) and keeps it in RAM, so
  * the following `UpdateSystem` applies exactly those revisions instead of
@@ -237,11 +238,15 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
  *
  * Flag mapping (see CLAUDE.md "System updates"): `NO_APPLY` →
  * `UpdateSystem("build")`, which realises the new closure and activates
- * nothing, leaving the app `GS_APP_STATE_UPDATABLE_LIVE`; anything else →
+ * nothing, leaving the app `GS_APP_STATE_UPDATABLE_LIVE`; `INTERACTIVE`
+ * without `NO_APPLY` → `UpdateSystem("switch")`, which activates the update on
+ * the running system, final state `GS_APP_STATE_INSTALLED` plus
+ * `GS_APP_QUIRK_NEEDS_REBOOT` only when `Store1.RebootRequired` says the
+ * running kernel/modules/initrd no longer match; anything else →
  * `UpdateSystem("boot")`, final state `GS_APP_STATE_PENDING_INSTALL` plus
- * `GS_APP_QUIRK_NEEDS_REBOOT`. `INTERACTIVE` is not read: a user clicking the
- * "Modulix OS" row gets the same `"boot"` the update monitor would have asked
- * for, never the old `UpdateSystem("switch")` (see update_mode_for_flags()).
+ * `GS_APP_QUIRK_NEEDS_REBOOT` unconditionally. A click's *download* job
+ * carries `INTERACTIVE` and `NO_APPLY` together, so it still maps to
+ * `"build"`: only its apply job switches (see update_mode_for_flags()).
  * `NO_DOWNLOAD` and `NO_APPLY` both set → task succeeds immediately, nothing to
  * do (unreachable in practice: gs-plugin-job-update-apps.c asserts against that
  * combination). `NO_DOWNLOAD` alone cannot be honoured — the daemon does not

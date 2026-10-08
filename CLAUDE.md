@@ -81,7 +81,7 @@ GNOME Software (user process)
 | `plugin/src/gs-modulix-list.c` | `list_apps` body: the four query shapes (search / installed / `alternate_of` / `is_for_update`), one `collect_into()` call per daemon read (the `is_for_update` shape instead delegates to `gs-modulix-update.c`). |
 | `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
 | `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). |
-| `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), checked via `Store1.CheckUpdate`, described from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`. See "System updates" below. |
+| `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), checked via `Store1.CheckUpdate`, described from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`, and after an interactive `"switch"` finished off with `Store1.RebootRequired`. See "System updates" below. |
 | `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
 | `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
 | `plugin/src/dbus/gs-modulix-bus.{c,h}` | The single memoized system-bus `GDBusConnection` (`gs_modulix_bus_init`/`_shutdown`) and the generic synchronous call helper (`gs_modulix_bus_call`) every wrapper below is built on. |
@@ -301,10 +301,11 @@ emitting a partial `AND` chain.
 There is no per-app "update" for a nix package or module — installing again
 via the lifecycle queue is how a newer version is picked up. The one thing
 that *is* an update is the NixOS system itself, backed by
-`Store1.CheckUpdate` + `Store1.ListOutdatedInputs` (reads) and
-`Daemon.UpdateSystem` (write; the daemon serves `"build"`/`"boot"`/`"switch"`,
-this plugin only ever asks for the first two — see the flags table below),
-implemented entirely in `plugin/src/gs-modulix-update.c`.
+`Store1.CheckUpdate`, `Store1.ListOutdatedInputs` and
+`Store1.RebootRequired` (reads) and `Daemon.UpdateSystem` (write; the daemon
+serves `"build"`/`"boot"`/`"switch"`/`"apply"`, this plugin asks for the first
+three — see the flags table below), implemented entirely in
+`plugin/src/gs-modulix-update.c`.
 
 **Modulix is continuous: this row is the only update path there is.** There is
 no major release, no distro upgrade, and deliberately no `GsUpgradeBanner` —
@@ -446,20 +447,38 @@ to call from a process without `PrivateTmp` too.
   | Flags | Mode | Cores | Pre-call state | Final state |
   |---|---|---|---|---|
   | `NO_APPLY` (± `INTERACTIVE`) | `"build"` | half | `DOWNLOADING` | `UPDATABLE_LIVE` |
-  | anything else (click **or** monitor) | `"boot"` | half | `INSTALLING` | `PENDING_INSTALL` (+ `NEEDS_REBOOT`) |
+  | `INTERACTIVE`, no `NO_APPLY` (a click) | `"switch"` | half | `INSTALLING` | `INSTALLED` (+ `NEEDS_REBOOT` **iff** `Store1.RebootRequired`) |
+  | anything else (the monitor) | `"boot"` | half | `INSTALLING` | `PENDING_INSTALL` (+ `NEEDS_REBOOT`) |
   | `NO_DOWNLOAD` **and** `NO_APPLY` | — (no-op) | — | untouched | untouched |
 
-  **`INTERACTIVE` is deliberately not read: there is one apply behaviour, the
-  automatic one.** It *is* GNOME Software's manual/automatic discriminant —
-  every click-driven path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
-  `gs-update-monitor.c` never does — and this plugin used to map it to
-  `UpdateSystem("switch")`: a `nixos-rebuild switch` on every core, activated in
-  the middle of the running session. A click now gets the same `"boot"` on half
-  the cores the monitor would have asked for, leaving the session its share of
-  the machine and surfacing the restart through `GS_APP_QUIRK_NEEDS_REBOOT`
-  (read by `src/gs-updates-page.c`'s `_get_app_section`,
-  `src/gs-updates-section.c` and `src/gs-common.c`). `"switch"` is now only
-  reachable from the `mx` CLI.
+  **`INTERACTIVE` is the manual/automatic discriminant, and it is read.** Every
+  click-driven path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
+  `gs-update-monitor.c` never does. A user who clicked "Update Now" therefore
+  gets `UpdateSystem("switch")` — the update applied to the running system —
+  while the monitor's unattended apply stays `UpdateSystem("boot")`, which only
+  pre-builds; `mx-apply-update.service` promotes it at shutdown. That split is
+  the daemon's own design: `modulix-daemon/src/command/update.rs` documents
+  `"switch"` as the manual path and the only mode that touches the running
+  system.
+
+  A click's *download* job carries `INTERACTIVE` **and** `NO_APPLY`, so it maps
+  to `"build"` like the monitor's — only the apply job that follows switches.
+
+  Two consequences to keep in mind:
+
+  - **After a `"switch"` the row is `INSTALLED`, not `PENDING_INSTALL`**: the
+    update *is* applied. `GS_APP_QUIRK_NEEDS_REBOOT` (read by
+    `src/gs-updates-page.c`'s `_get_app_section`, `src/gs-updates-section.c`
+    and `src/gs-common.c`) is then added only when `Store1.RebootRequired`
+    reports that the running kernel, kernel modules or initrd no longer match
+    the activated system — an exact comparison of `/run/booted-system` with
+    `/run/current-system`, not a guess from package names. A switch that moved
+    only userspace prompts for nothing.
+  - **The daemon does not restart itself across a `"switch"`**
+    (`restartIfChanged = false`), so an update carrying a new daemon keeps
+    being served by the old binary until the next boot or an explicit
+    `systemctl restart`. Never assume a fresh version's methods exist right
+    after one.
 
   The row itself **stays** on the Updates page. Hiding it (it is listable only
   for the monitor: `src/gs-updates-page.c:670` passes
