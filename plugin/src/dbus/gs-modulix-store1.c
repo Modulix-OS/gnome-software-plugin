@@ -110,3 +110,9 @@ gboolean gs_modulix_store1_check_update(void) {
   return reply != NULL && g_variant_get_boolean(reply);
 }
 
+gboolean gs_modulix_store1_reboot_required(void) {
+  g_autoptr(GVariant) reply =
+      store1_call("RebootRequired", NULL, G_VARIANT_TYPE("(bas)"),
+                  MODULIX_STORE1_TIMEOUT_MS);
+  return reply != NULL && g_variant_get_boolean(reply);
+}

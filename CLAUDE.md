@@ -510,6 +510,7 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
 | `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache, refilled by `CheckUpdate`; empty = up to date) |
 | `Store1` | `CheckUpdate` | — | `b` (full `nix flake update`, minutes; memoizes the candidate `flake.lock`) |
+| `Store1` | `RebootRequired` | — | `(bas)` (reboot needed + what moved since boot; memoized per activation) |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |

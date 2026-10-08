@@ -156,4 +156,34 @@ GVariant *gs_modulix_store1_list_outdated_inputs(gboolean force_refresh);
  */
 gboolean gs_modulix_store1_check_update(void);
 
+/**
+ * @brief `RebootRequired() -> (bas)`: whether the running system still needs a
+ *   reboot.
+ *
+ * A `Daemon.UpdateSystem("switch")` replaces the system closure under the live
+ * session, but not the kernel, the kernel modules or the initrd the machine is
+ * *running*. This call is how the plugin tells "updated, nothing left to do"
+ * from "updated, restart to pick up the new kernel" once a switch has
+ * succeeded. The daemon answers exactly, by comparing `/run/booted-system`
+ * with `/run/current-system`, not by guessing from package names.
+ *
+ * It answers for the running system, not for an update: a machine switched and
+ * never rebooted keeps reporting TRUE however long ago that was.
+ *
+ * Blocking, but cheap: the daemon memoises the answer per activation. The
+ * first call after a switch spawns `nix store diff-closures`, so call it from
+ * the worker thread that ran the update, not from the main loop.
+ *
+ * The reply's second member, the `as` describing what moved since boot, is
+ * **not** returned here: gs_modulix_bus_call() unwraps a reply to its first
+ * child, so plumbing it through would mean a second unwrap convention for one
+ * value the plugin has nowhere to show. It stays on the bus for `mx` and
+ * d-spy.
+ *
+ * @return TRUE when a reboot is needed, FALSE when it is not or the call
+ *   failed (a failure is logged, then reported as "no reboot needed" — same
+ *   NULL-is-empty convention as the reads above).
+ */
+gboolean gs_modulix_store1_reboot_required(void);
+
 G_END_DECLS
