@@ -36,6 +36,10 @@ run-gs-log: install-dev
 build-package:
     nix build .#default
 
+# Build both architectures and push their closures to the Modulix Attic cache.
+push-cache:
+    nix run .#push-cache
+
 # Confirm the entry-point symbol is exported.
 check-plugin: install-dev
     #!/usr/bin/env bash

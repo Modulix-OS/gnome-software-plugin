@@ -7,7 +7,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
 
@@ -96,12 +96,27 @@
             ${gnome-software-patched}/bin/gnome-software "$@"
         '';
 
+        push-cache = import ./nix/attic-push.nix {
+          inherit pkgs;
+          attrs = [ "plugin" "gnome-software-modulix" ];
+          flakeRef = "path:${self}";
+          tokenFile =
+            if builtins.pathExists ./secrets/attic-token.age
+            then ./secrets/attic-token.age
+            else null;
+        };
+
       in
       {
         packages = {
-          inherit plugin;
+          inherit plugin push-cache;
           default = gnome-software-modulix;
           gnome-software-modulix = gnome-software-modulix;
+        };
+
+        apps.push-cache = {
+          type = "app";
+          program = "${push-cache}/bin/mx-push-cache";
         };
 
         devShells.default = pkgs.mkShell {
