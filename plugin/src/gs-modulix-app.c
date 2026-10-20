@@ -159,8 +159,8 @@ void gs_app_set_priority(GsApp *app, guint priority);
  */
 static guint modulix_match_value(guint score, gboolean is_module) {
   guint capped = MIN(score, (guint)MODULIX_MATCH_EXACT_SCORE);
-  guint scaled = MAX(
-      1u, (capped * MODULIX_MATCH_SCALE_MAX) / MODULIX_MATCH_EXACT_SCORE);
+  guint scaled =
+      MAX(1u, (capped * MODULIX_MATCH_SCALE_MAX) / MODULIX_MATCH_EXACT_SCORE);
   return is_module ? MODULIX_MATCH_MODULE_BONUS + scaled : scaled;
 }
 
@@ -482,7 +482,7 @@ GsApp *gs_modulix_make_app_from_variant(GVariant *dict, GsPlugin *plugin,
                                         gboolean is_installed) {
   const gchar *name = NULL, *base_name = NULL, *pname = NULL, *a_name = NULL;
   const gchar *summary = NULL, *version = NULL, *app_id = NULL,
-             *group_id = NULL;
+              *group_id = NULL;
   const gchar *icon = NULL, *icon_name = NULL, *kind = NULL;
   gboolean fp_pref = FALSE;
   gint variant_rank = 0;
@@ -516,8 +516,8 @@ GsApp *gs_modulix_make_app_from_variant(GVariant *dict, GsPlugin *plugin,
   gboolean installed = has_installed ? installed_val : is_installed;
 
   const gchar *app_unique_id = (group_id && *group_id) ? group_id
-                               : (app_id && *app_id)    ? app_id
-                                                        : name;
+                               : (app_id && *app_id)   ? app_id
+                                                       : name;
   g_autofree gchar *cache_key =
       g_strdup_printf("%s\x1f%s", (kind && *kind) ? kind : "package", name);
   static GMutex cache_key_mutex;
@@ -535,9 +535,9 @@ GsApp *gs_modulix_make_app_from_variant(GVariant *dict, GsPlugin *plugin,
   if (is_module)
     gs_app_set_priority(app, MODULIX_PRIORITY_MODULE);
 
-  const gchar *display_name = (a_name && *a_name)   ? a_name
-                              : (pname && *pname)    ? pname
-                                                      : name;
+  const gchar *display_name = (a_name && *a_name) ? a_name
+                              : (pname && *pname) ? pname
+                                                  : name;
   gs_app_set_name(app, GS_APP_QUALITY_NORMAL, display_name);
   gs_app_set_summary(app, GS_APP_QUALITY_NORMAL, summary ? summary : "");
   gs_app_set_kind(app, AS_COMPONENT_KIND_DESKTOP_APP);
@@ -573,31 +573,37 @@ GsApp *gs_modulix_make_app_from_variant(GVariant *dict, GsPlugin *plugin,
 
   if (!gs_app_has_icons(app) &&
       gs_modulix_icon_resolve(app, app_id, icon_name, name, base_name, icon))
-    g_object_set_data(G_OBJECT(app), "modulix::icon-themed", GINT_TO_POINTER(1));
+    g_object_set_data(G_OBJECT(app), "modulix::icon-themed",
+                      GINT_TO_POINTER(1));
 
   gs_app_set_origin(app, is_module ? "modulix" : name);
   gs_app_set_origin_hostname(app, "nixos.org");
 
   if (is_module) {
-    gs_app_set_origin_ui(app, _("Modulix OS"));
+    gs_app_set_origin_ui(app, _("Module Modulix OS"));
     gs_app_set_metadata(app, "GnomeSoftware::PackagingFormat", _("Module"));
     gs_app_set_metadata(app, "GnomeSoftware::PackagingIcon", "modulix-logo");
-    gs_app_set_metadata(app, "GnomeSoftware::PackagingBaseCssColor", "accent_color");
+    gs_app_set_metadata(app, "GnomeSoftware::PackagingBaseCssColor",
+                        "accent_color");
   } else {
     gs_app_set_origin_ui(app, name);
-    gs_app_set_metadata(app, "GnomeSoftware::PackagingFormat", _("Nix Package"));
+    gs_app_set_metadata(app, "GnomeSoftware::PackagingFormat",
+                        _("Nix Package"));
     gs_app_set_metadata(app, "GnomeSoftware::PackagingIcon", "nix-snowflake");
-    gs_app_set_metadata(app, "GnomeSoftware::PackagingBaseCssColor", "error_color");
+    gs_app_set_metadata(app, "GnomeSoftware::PackagingBaseCssColor",
+                        "error_color");
   }
 
   g_object_set_data_full(G_OBJECT(app), "modulix::kind",
                          g_strdup(kind && *kind ? kind : "package"), g_free);
-  g_object_set_data_full(G_OBJECT(app), "modulix::name", g_strdup(name), g_free);
+  g_object_set_data_full(G_OBJECT(app), "modulix::name", g_strdup(name),
+                         g_free);
   if (app_id && *app_id)
-    g_object_set_data_full(G_OBJECT(app), "modulix::app_id",
-                           g_strdup(app_id), g_free);
+    g_object_set_data_full(G_OBJECT(app), "modulix::app_id", g_strdup(app_id),
+                           g_free);
   if (icon && *icon)
-    g_object_set_data_full(G_OBJECT(app), "modulix::icon", g_strdup(icon), g_free);
+    g_object_set_data_full(G_OBJECT(app), "modulix::icon", g_strdup(icon),
+                           g_free);
   if (icon_name && *icon_name)
     g_object_set_data_full(G_OBJECT(app), "modulix::icon_name",
                            g_strdup(icon_name), g_free);
@@ -688,8 +694,8 @@ const gchar *gs_modulix_app_name(GsApp *app) {
  * `management-plugin` = @p plugin; `name` at GS_APP_QUALITY_NORMAL =
  * plugin name; `summary` at GS_APP_QUALITY_NORMAL = description;
  * `kind` = AS_COMPONENT_KIND_ADDON; `state` = INSTALLED/AVAILABLE per
- * the resolved `installed` value, unless gs_modulix_state_is_transient() says the
- * addon's current state must be left alone; `bundle-kind` =
+ * the resolved `installed` value, unless gs_modulix_state_is_transient() says
+ * the addon's current state must be left alone; `bundle-kind` =
  * AS_BUNDLE_KIND_PACKAGE. Object data: `"modulix::kind"` = `"plugin"`,
  * `"modulix::name"` = the addon id, `"modulix::parent"` = @p
  * module_name, `"modulix::plugin_name"` = the bare plugin name.
@@ -757,8 +763,7 @@ void gs_modulix_add_module_plugins(GsApp *module_app, const gchar *module_name,
  *   sharing the same (module, name). NULL when @p dict has no non-empty
  *   `"name"` key.
  */
-GsApp *gs_modulix_make_plugin_app_from_variant(GVariant *dict,
-                                               GsPlugin *plugin,
+GsApp *gs_modulix_make_plugin_app_from_variant(GVariant *dict, GsPlugin *plugin,
                                                const gchar *module_fallback) {
   const gchar *pname = NULL;
   g_variant_lookup(dict, "name", "&s", &pname);
