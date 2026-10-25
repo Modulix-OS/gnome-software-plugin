@@ -22,7 +22,7 @@
         # ─── The plugin (.so) ───────────────────────────────────────────────
         plugin = pkgs.stdenv.mkDerivation {
           pname = "gnome-software-plugin-modulix";
-          version = "0.1.0";
+          version = "1.0.0";
           src = ./.;
 
           nativeBuildInputs = [
