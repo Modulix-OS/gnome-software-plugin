@@ -5,7 +5,7 @@
   tokenFile ? null,
   endpoint ? "https://cache.modulixos.org:8443",
   cache ? "modulix",
-  systems ? [ "x86_64-linux" "aarch64-linux" ],
+  systems ? [ "x86_64-linux" ],
 }:
 
 let
