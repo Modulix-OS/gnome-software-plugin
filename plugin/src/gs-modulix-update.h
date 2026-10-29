@@ -33,12 +33,11 @@
  *
  * GNOME Software applies an update in two successive jobs, a `NO_APPLY`
  * "download" then an apply, and the second one is only issued if the app is
- * still `GS_APP_STATE_UPDATABLE_LIVE` when the first finishes. That split is the
- * only thing the mode depends on: `NO_APPLY` maps to `"build"` (realise the
- * closure, activate nothing, keep the state), the apply job maps to `"boot"`.
- * `"switch"` is never requested from here any more — a click in the Updates page
- * now gets exactly the automatic behaviour, see update_mode_for_flags()
- * (`gs-modulix-update.c`) for why.
+ * still `GS_APP_STATE_UPDATABLE_LIVE` when the first finishes. The daemon has
+ * no download-only mode, so the `NO_APPLY` job is a no-op here that leaves
+ * that state untouched, and only the apply job calls `UpdateSystem`:
+ * `INTERACTIVE` maps it to `"switch"`, anything else to `"boot"`. See
+ * update_mode_for_flags() (`gs-modulix-update.c`).
  */
 #pragma once
 
@@ -147,10 +146,10 @@ gboolean gs_modulix_update_sync(GsPlugin *plugin, gboolean force_refresh);
  *   **minutes**, not milliseconds. Worker thread only, and only on an
  *   explicit refresh; listing the Updates page must keep using
  *   gs_modulix_update_sync().
- * @post The cached "Modulix OS" GsApp's dynamic fields reflect the check, and
- *   the daemon holds a candidate lockfile iff this returned TRUE. A TRUE answer
- *   also resets the phase to #GS_MODULIX_UPDATE_PHASE_IDLE: the new candidate
- *   obsoletes whatever a previous `"build"` realised.
+ * @post The cached "Modulix OS" GsApp's dynamic fields reflect the check.
+ *   Nothing is kept daemon-side: an `UpdateSystem` that follows re-resolves
+ *   the refresh itself. A TRUE answer also resets the phase to
+ *   #GS_MODULIX_UPDATE_PHASE_IDLE.
  * @return TRUE when an update is available, FALSE when the system is current
  *   or the check failed (already logged, reported as "nothing to update").
  */
@@ -236,27 +235,27 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
  * `modulix::kind` == `"update"`) is acted on; if @p list carries none, the
  * task succeeds immediately without touching the daemon.
  *
- * Flag mapping (see CLAUDE.md "System updates"): `NO_APPLY` →
- * `UpdateSystem("build")`, which realises the new closure and activates
- * nothing, leaving the app `GS_APP_STATE_UPDATABLE_LIVE`; `INTERACTIVE`
- * without `NO_APPLY` → `UpdateSystem("switch")`, which activates the update on
- * the running system, final state `GS_APP_STATE_INSTALLED` plus
+ * Flag mapping (see CLAUDE.md "System updates"): `NO_APPLY` → nothing at all,
+ * the task succeeds immediately and the app keeps its
+ * `GS_APP_STATE_UPDATABLE_LIVE` state (the daemon has no download-only mode,
+ * so there is nothing for a "download" job to ask it); `INTERACTIVE` without
+ * `NO_APPLY` → `UpdateSystem("switch")`, which activates the update on the
+ * running system, final state `GS_APP_STATE_INSTALLED` plus
  * `GS_APP_QUIRK_NEEDS_REBOOT` only when `Store1.RebootRequired` says the
  * running kernel/modules/initrd no longer match; anything else →
  * `UpdateSystem("boot")`, final state `GS_APP_STATE_PENDING_INSTALL` plus
  * `GS_APP_QUIRK_NEEDS_REBOOT` unconditionally. A click's *download* job
- * carries `INTERACTIVE` and `NO_APPLY` together, so it still maps to
- * `"build"`: only its apply job switches (see update_mode_for_flags()).
- * `NO_DOWNLOAD` and `NO_APPLY` both set → task succeeds immediately, nothing to
- * do (unreachable in practice: gs-plugin-job-update-apps.c asserts against that
- * combination). `NO_DOWNLOAD` alone cannot be honoured — the daemon does not
- * separate download from apply once asked to apply — so it applies.
+ * carries `INTERACTIVE` and `NO_APPLY` together, so it is a no-op too: only
+ * its apply job switches (see update_mode_for_flags()). `NO_DOWNLOAD` alone
+ * cannot be honoured — the daemon does not separate download from apply once
+ * asked to apply — so it applies.
  *
- * Leaving the app `UPDATABLE_LIVE` after `"build"` is load-bearing, not
- * cosmetic: `_should_auto_update()` (`src/gs-update-monitor.c`) re-reads the
- * state when the `NO_APPLY` job completes and only issues the apply job for an
- * app still in that state. Applying from the `NO_APPLY` job instead — which this
- * plugin used to do, mapping it to `"boot"` — silently ended the sequence there.
+ * Leaving the app `UPDATABLE_LIVE` through the `NO_APPLY` job is load-bearing,
+ * not cosmetic: `_should_auto_update()` (`src/gs-update-monitor.c`) re-reads
+ * the state when that job completes and only issues the apply job for an app
+ * still in that state. Applying from the `NO_APPLY` job instead — which this
+ * plugin used to do, mapping it to `"boot"` — silently ended the sequence
+ * there.
  *
  * At most one update runs at a time process-wide: a second call while one is
  * already running fails immediately with `GS_PLUGIN_ERROR_FAILED`, without

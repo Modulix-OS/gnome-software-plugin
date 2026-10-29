@@ -303,8 +303,8 @@ via the lifecycle queue is how a newer version is picked up. The one thing
 that *is* an update is the NixOS system itself, backed by
 `Store1.CheckUpdate`, `Store1.ListOutdatedInputs` and
 `Store1.RebootRequired` (reads) and `Daemon.UpdateSystem` (write; the daemon
-serves `"build"`/`"boot"`/`"switch"`/`"apply"`, this plugin asks for the first
-three — see the flags table below), implemented entirely in
+serves `"switch"` and `"boot"`, and this plugin asks for both — see the flags
+table below), implemented entirely in
 `plugin/src/gs-modulix-update.c`.
 
 **Modulix is continuous: this row is the only update path there is.** There is
@@ -332,42 +332,32 @@ and GNOME Software then only posted a notification. The Updates page's manual
 Download/Update buttons are the same two-step pair
 (`src/gs-updates-section.c:454`, `:496`).
 
-**The two reads are not interchangeable.** `CheckUpdate` is the *search*: the
-daemon runs a full `nix flake update --output-lock-file` into a scratch file
-(minutes, refetches every input), keeps the resulting `flake.lock` in RAM
-(`PENDING_LOCK`, no TTL), and refills its own outdated-inputs cache from a
-**local** diff of the old and new lockfiles. `UpdateSystem` then *writes that
-exact lockfile* instead of re-resolving — so the revisions installed are the
-ones the user was shown, and the network cost is paid once.
-`ListOutdatedInputs` is the *display*: cached rows describing that candidate,
-free once a check ran. Only `gs_modulix_update_check()` spends the first;
-`gs_modulix_update_list()` (every visit to the Updates page) reads the second.
+**The two reads share one probe.** `CheckUpdate` and `ListOutdatedInputs` both
+go through the daemon's cached `outdated_entries`, which asks `nix flake
+metadata <ref> --json --refresh --no-write-lock-file` once per direct input and
+writes nothing anywhere. `CheckUpdate` forces a fresh probe and reports
+`!empty` (minutes, refetches every input's metadata); `ListOutdatedInputs` is
+the *display*, free once a check ran because it reads the very same cache.
+Only `gs_modulix_update_check()` spends the first; `gs_modulix_update_list()`
+(every visit to the Updates page) reads the second.
 
-`"build"` mode is the one write that does **not** consume that memoized
-lockfile: it reads it with `store::peek_pending_lock()` (daemon side) precisely
-so the `"boot"` that follows applies the very revisions it just built. It is
-also the one mode that writes nothing at all — no `flake.lock` in
-the config repo, no commit, no activation: `update::build_with_lock()`
-(`modulix-core-utils`) stages a throwaway copy of the config dir carrying the
-candidate lock and runs `nixos-rebuild build` there. Writing the candidate into
-the real repo would move the configuration ahead of the running system, and the
-next `CheckUpdate` would then report "up to date" while the system is still
-behind. `Daemon::run` correspondingly skips its outdated-cache /
-pending-lock / package-index invalidations for `"build"`.
+**Nothing is memoized between a check and an update.** There is no candidate
+lockfile any more — `modulix_core_utils::update::update` refreshes
+`flake.lock` inside its own commit when the apply runs, so the revisions
+installed are whatever upstream carries then, not the ones the user was shown.
+`UpdateSystem` has exactly two modes, `"switch"` and `"boot"`, and both apply;
+`"build"`, `"stage"` and `"apply"` were removed from the daemon and are
+rejected as unknown modes. A build-without-activating cannot exist on top of
+`update()`: it would commit the refreshed lock and leave the apply that
+followed with nothing to move.
 
-That scratch directory lives under `/tmp`, and `mx-daemon` runs as root, so
-`modulix-daemon.service` now sets `PrivateTmp = true` (in
-`mxpkgs/modulixos/modulix-daemon/default.nix`) — no symlink anyone plants in the
-shared `/tmp` is reachable. `PrivateTmp` alone would have broken more than it
-fixed: `/tmp/mx-build-queue` and `/tmp/mx-skip-rebuild.lock`
-(`modulix-core-utils/src/core/transaction/`) are **cross-process** rendezvous
-between the daemon, the `mx` CLI and `mx-init`, and a private `/tmp` would have
-hidden them from each other, letting two rebuilds run at once. Both are
-therefore re-exposed with `BindPaths`, and pre-created by `systemd.tmpfiles`
-rules so the bind sources always exist (hence the added
-`after = systemd-tmpfiles-setup.service`). `build_with_lock` still creates its
-directory with `create_dir` rather than `create_dir_all`, so the library is safe
-to call from a process without `PrivateTmp` too.
+`/tmp/mx-build-queue` (`modulix-core-utils/src/core/transaction/`) is a
+**cross-process** rendezvous between the daemon, the `mx` CLI and `mx-init`,
+and `modulix-daemon.service` sets `PrivateTmp = true`, so it is re-exposed
+with `BindPaths` and pre-created by a `systemd.tmpfiles` rule (hence
+`after = systemd-tmpfiles-setup.service`). The companion
+`/tmp/mx-skip-rebuild.lock` sentinel is gone, removed in core-utils v1.1.0
+along with `Transaction::set_skip_rebuild`.
 
 - **One synthetic `GsApp`** represents the whole system, built/reused via
   `gs_modulix_update_get_app()` (same plugin-cache "one GsApp per key" rule
@@ -446,23 +436,24 @@ to call from a process without `PrivateTmp` too.
 
   | Flags | Mode | Cores | Pre-call state | Final state |
   |---|---|---|---|---|
-  | `NO_APPLY` (± `INTERACTIVE`) | `"build"` | half | `DOWNLOADING` | `UPDATABLE_LIVE` |
+  | `NO_APPLY` (± `INTERACTIVE`) | — (no-op) | — | untouched | untouched |
   | `INTERACTIVE`, no `NO_APPLY` (a click) | `"switch"` | half | `INSTALLING` | `INSTALLED` (+ `NEEDS_REBOOT` **iff** `Store1.RebootRequired`) |
   | anything else (the monitor) | `"boot"` | half | `INSTALLING` | `PENDING_INSTALL` (+ `NEEDS_REBOOT`) |
-  | `NO_DOWNLOAD` **and** `NO_APPLY` | — (no-op) | — | untouched | untouched |
 
   **`INTERACTIVE` is the manual/automatic discriminant, and it is read.** Every
   click-driven path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
   `gs-update-monitor.c` never does. A user who clicked "Update Now" therefore
   gets `UpdateSystem("switch")` — the update applied to the running system —
-  while the monitor's unattended apply stays `UpdateSystem("boot")`, which only
-  pre-builds; `mx-apply-update.service` promotes it at shutdown. That split is
+  while the monitor's unattended apply stays `UpdateSystem("boot")`, a
+  `nixos-rebuild boot` that leaves the running system alone and makes the new
+  one the next boot's default. That split is
   the daemon's own design: `modulix-daemon/src/command/update.rs` documents
   `"switch"` as the manual path and the only mode that touches the running
   system.
 
-  A click's *download* job carries `INTERACTIVE` **and** `NO_APPLY`, so it maps
-  to `"build"` like the monitor's — only the apply job that follows switches.
+  A click's *download* job carries `INTERACTIVE` **and** `NO_APPLY`, so it is a
+  no-op like the monitor's download job — only the apply job that follows
+  touches the daemon.
 
   Two consequences to keep in mind:
 
@@ -493,12 +484,10 @@ to call from a process without `PrivateTmp` too.
   (`src/gs-updates-section.c`) renders those sections' button unconditionally,
   never looking at quirks.
 
-  Restoring `UPDATABLE_LIVE` after `"build"` is load-bearing, not cosmetic — it
-  is the single thing that lets the apply job be issued at all (see the two-job
-  note above). The `NO_DOWNLOAD | NO_APPLY` no-op branch is unreachable in
-  practice: `lib/gs-plugin-job-update-apps.c` `g_assert`s against that
-  combination. `NO_DOWNLOAD` alone still cannot be honoured as "download only" —
-  it takes the apply path.
+  Leaving `UPDATABLE_LIVE` untouched through the `NO_APPLY` job is
+  load-bearing, not cosmetic — it is the single thing that lets the apply job
+  be issued at all (see the two-job note above). `NO_DOWNLOAD` alone still
+  cannot be honoured as "download only" — it takes the apply path.
 - **No progress reporting**: the daemon emits no progress signal, so
   `update_apps_async` calls `progress_callback` once with
   `GS_APP_PROGRESS_UNKNOWN` right before the blocking call starts —
@@ -529,12 +518,12 @@ Both interfaces are served at the same object path (`/org/modulix/Daemon`) by
 | `Store1` | `GetPackageLicenses` | `as` (nix attrs) | `a{ss}` |
 | `Store1` | `ListOutdatedInputs` | `b` (force_refresh) | `aa{sv}` (1h cache, refilled by `CheckUpdate`; empty = up to date) |
 | `Store1` | `CheckUpdate` | — | `b` (full `nix flake update`, minutes; memoizes the candidate `flake.lock`) |
-| `Store1` | `RebootRequired` | — | `(bas)` (reboot needed + what moved since boot; memoized per activation) |
+| `Store1` | `RebootRequired` | — | `b` (reboot needed; pure read, three readlinks) |
 | `Store1` | property `IndexReady` | — | `b` |
 | `Daemon` (write, polkit-gated) | `InstallPackage` / `UninstallPackage` | `as` | `s` (status text) |
 | `Daemon` | `InstallModule` / `UninstallModule` | `as` | `s` |
 | `Daemon` | `InstallPlugin` / `UninstallPlugin` | `ss` (module, plugin) | `s` |
-| `Daemon` | `UpdateSystem` | `s` (mode: `"switch"`/`"boot"`/`"build"`) | `s` |
+| `Daemon` | `UpdateSystem` | `s` (mode: `"switch"`/`"boot"`) | `s` |
 
 Success = a D-Bus reply with no error. Packages/modules are batched into one
 `as` call each; plugins are called individually. `a{sv}` entry field names

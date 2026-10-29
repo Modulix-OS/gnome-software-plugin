@@ -60,15 +60,17 @@ gchar *gs_modulix_daemon1_plugin_call(const gchar *method,
 /**
  * @brief `UpdateSystem(s mode) -> s`.
  *
- * @param mode `"switch"` (apply now, all cores), `"boot"` (apply on next boot,
- *   half the cores) or `"build"` (realise the new closure without activating
- *   anything, half the cores — the "download" step); treated as `""` if NULL.
+ * @param mode `"switch"` (refresh every flake input and activate the result
+ *   now) or `"boot"` (same work, but the running system is left alone and the
+ *   new one becomes the next boot's default); both capped to half the cores.
+ *   Treated as `""` if NULL, which the daemon rejects as an unknown mode.
  * @param error Set on failure, as in gs_modulix_daemon1_names_call().
  * @pre None beyond gs_modulix_bus_init() having succeeded.
  * @post Blocks for the whole `nix flake update` + `nixos-rebuild` (no
- *   timeout) — commonly minutes. `"build"` leaves the system, the boot entries
- *   and the configuration repository untouched, and leaves the daemon's
- *   candidate lockfile pending for the `"switch"`/`"boot"` that follows.
+ *   timeout) — commonly minutes. The daemon commits the refreshed
+ *   `flake.lock` and rebuilds, or does neither when every input was already
+ *   current; the reply does not say which, so the same status string comes
+ *   back either way.
  * @return (transfer full) (nullable): the daemon's status string, which the
  *   caller must g_free(); NULL on failure, with @p error set.
  */

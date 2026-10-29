@@ -157,7 +157,7 @@ GVariant *gs_modulix_store1_list_outdated_inputs(gboolean force_refresh);
 gboolean gs_modulix_store1_check_update(void);
 
 /**
- * @brief `RebootRequired() -> (bas)`: whether the running system still needs a
+ * @brief `RebootRequired() -> b`: whether the running system still needs a
  *   reboot.
  *
  * A `Daemon.UpdateSystem("switch")` replaces the system closure under the live
@@ -170,15 +170,10 @@ gboolean gs_modulix_store1_check_update(void);
  * It answers for the running system, not for an update: a machine switched and
  * never rebooted keeps reporting TRUE however long ago that was.
  *
- * Blocking, but cheap: the daemon memoises the answer per activation. The
- * first call after a switch spawns `nix store diff-closures`, so call it from
- * the worker thread that ran the update, not from the main loop.
- *
- * The reply's second member, the `as` describing what moved since boot, is
- * **not** returned here: gs_modulix_bus_call() unwraps a reply to its first
- * child, so plumbing it through would mean a second unwrap convention for one
- * value the plugin has nowhere to show. It stays on the bus for `mx` and
- * d-spy.
+ * Blocking, but a pure read on the daemon's side: three `readlink`s, no
+ * subprocess. The reply used to carry a second member, an `as` of what moved
+ * since boot from `nix store diff-closures`; the daemon dropped it, so the
+ * signature is a plain `b`.
  *
  * @return TRUE when a reboot is needed, FALSE when it is not or the call
  *   failed (a failure is logged, then reported as "no reboot needed" — same

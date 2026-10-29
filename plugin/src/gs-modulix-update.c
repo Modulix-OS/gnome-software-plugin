@@ -338,19 +338,27 @@ void gs_modulix_update_release(void) {
  * GNOME Software applies an update in two jobs: a `NO_APPLY` one ("download"),
  * then — only if the app is still `GS_APP_STATE_UPDATABLE_LIVE` when the first
  * finishes (`_should_auto_update()` in `src/gs-update-monitor.c`) — a second
- * one that applies. `NO_APPLY` therefore decides *whether* anything is
- * activated, and `INTERACTIVE` decides *when*.
+ * one that applies. The daemon has no download-only mode (see below), so the
+ * `NO_APPLY` job never reaches this function: gs_modulix_update_apps_async()
+ * treats it as a no-op. Only the apply job gets here, and `INTERACTIVE`
+ * decides *when* it takes effect.
  *
  * `INTERACTIVE` is GNOME Software's manual/automatic discriminant: every
  * click-driven path sets it (`src/gs-updates-section.c`, `src/gs-page.c`),
  * `gs-update-monitor.c` never does. Reading it is what makes a user who
  * clicked "Update Now" get the update *now* — `UpdateSystem("switch")`,
  * a `nixos-rebuild switch` that replaces the running system — while the
- * monitor's unattended apply stays `UpdateSystem("boot")`, which only
- * pre-builds; `mx-apply-update.service` promotes it at shutdown. That split is
- * the daemon's own design (`modulix-daemon/src/command/update.rs`): `"switch"`
- * is documented there as the manual path and the only mode that touches the
- * running system.
+ * monitor's unattended apply stays `UpdateSystem("boot")`, a
+ * `nixos-rebuild boot` that leaves the running system alone and makes the new
+ * one the next boot's default. That split is the daemon's own design
+ * (`modulix-daemon/src/command/update.rs`): `"switch"` is documented there as
+ * the manual path and the only mode that touches the running system.
+ *
+ * There is no `"build"` mode any more. `modulix_core_utils::update::update`
+ * refreshes `flake.lock` inside its own commit, so a build-without-activating
+ * would commit the new lock and leave the apply that follows with nothing to
+ * move — and nothing activated. The whole download and build cost is
+ * therefore paid by the apply job.
  *
  * Note the daemon does **not** restart itself across a `"switch"`
  * (`restartIfChanged = false`), so an update carrying a new daemon keeps being
@@ -363,19 +371,14 @@ void gs_modulix_update_release(void) {
  * `src/gs-update-monitor.c`).
  *
  * @param flags Flags the vfunc was called with.
- * @pre None.
+ * @pre `flags` must not carry `NO_APPLY`; that case is handled before the
+ *   call and never gets here.
  * @post None (pure function).
- * @return `"build"` when `NO_APPLY` is set (realise the closure, activate
- *   nothing) — including for a click, whose download job carries both flags;
- *   `"switch"` for an interactive apply (activate now); `"boot"` for an
+ * @return `"switch"` for an interactive apply (activate now), `"boot"` for an
  *   unattended one (activate at the next boot). Never NULL.
  */
 static const gchar *update_mode_for_flags(GsPluginUpdateAppsFlags flags) {
-  if (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY)
-    return "build";
-  if (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE)
-    return "switch";
-  return "boot";
+  return (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_INTERACTIVE) ? "switch" : "boot";
 }
 
 /**
@@ -392,10 +395,7 @@ static const gchar *update_mode_for_flags(GsPluginUpdateAppsFlags flags) {
  *   convention as gs-modulix-lifecycle.c's call_names()).
  * @pre Called off the main thread: `UpdateSystem` blocks for the whole
  *   rebuild, and the `"switch"` branch adds a `RebootRequired` round-trip.
- * @post On success, one of three outcomes:
- *   - `"build"` restores `GS_APP_STATE_UPDATABLE_LIVE` (nothing was applied,
- *     and that state is what lets GNOME Software issue the apply job that
- *     follows);
+ * @post On success, one of two outcomes:
  *   - `"switch"` retires the `CheckUpdate` memo and lands on
  *     `GS_APP_STATE_INSTALLED` — the update *is* applied — carrying
  *     `GS_APP_QUIRK_NEEDS_REBOOT` only if
@@ -428,14 +428,6 @@ static gboolean gs_modulix_update_run(GsPlugin *plugin G_GNUC_UNUSED,
     g_set_error_literal(error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
                         "Modulix system update failed");
     return FALSE;
-  }
-
-  if (g_strcmp0(mode, "build") == 0) {
-    /* Nothing was applied; the app must be back to UPDATABLE_LIVE by the time
-     * the job completes, or _should_auto_update() drops it and the apply job is
-     * never issued. */
-    update_set_state(app, GS_APP_STATE_UPDATABLE_LIVE, FALSE);
-    return TRUE;
   }
 
   check_memo_set(FALSE);
@@ -512,8 +504,12 @@ void gs_modulix_update_apps_async(GsPlugin *plugin, GsAppList *list,
   g_task_set_source_tag(task, source_tag);
 
   GsApp *app = find_update_app(plugin, list);
-  gboolean no_op = (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_DOWNLOAD) &&
-                   (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY);
+  /* The daemon has no download-only mode, so a `NO_APPLY` job has nothing to
+   * do: it returns without touching the daemon and without changing the app's
+   * state, leaving it UPDATABLE_LIVE so _should_auto_update() still issues the
+   * apply job that follows. That also covers the NO_DOWNLOAD + NO_APPLY
+   * combination, which was always a no-op. */
+  gboolean no_op = (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY) != 0;
 
   if (app == NULL || no_op) {
     g_task_return_boolean(task, TRUE);
@@ -528,11 +524,7 @@ void gs_modulix_update_apps_async(GsPlugin *plugin, GsAppList *list,
     return;
   }
 
-  update_set_state(app,
-                   (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY)
-                       ? GS_APP_STATE_DOWNLOADING
-                       : GS_APP_STATE_INSTALLING,
-                   FALSE);
+  update_set_state(app, GS_APP_STATE_INSTALLING, FALSE);
   gs_app_set_progress(app, GS_APP_PROGRESS_UNKNOWN);
   if (progress_cb != NULL)
     progress_cb(plugin, GS_APP_PROGRESS_UNKNOWN, progress_data);
