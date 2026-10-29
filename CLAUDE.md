@@ -80,7 +80,7 @@ GNOME Software (user process)
 | `plugin/src/gs-plugin-modulix.c` | GObject shell only: type definition, `setup_async` (locale, icon theme, resolver, `gs_modulix_bus_init`), vfunc plumbing, `gs_plugin_query_type`. |
 | `plugin/src/gs-modulix-list.c` | `list_apps` body: the four query shapes (search / installed / `alternate_of` / `is_for_update`), one `collect_into()` call per daemon read (the `is_for_update` shape instead delegates to `gs-modulix-update.c`). |
 | `plugin/src/gs-modulix-refine.c` | `refine` body: batched enrichment + license prefetches, then the per-app steps (addons, icon, description seed, license, Flathub enrichment). |
-| `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: the coalescing queue (`GsModulixLifecycle`), its single drain worker, and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). |
+| `plugin/src/gs-modulix-lifecycle.c` | `install_apps`/`uninstall_apps`: one `GTask` worker thread per request (`start_lifecycle` → `lifecycle_thread`) and the `org.modulix.Daemon` write calls (`gs-modulix-daemon1.c`). No local queue — `mx-daemon` serializes its own writes via `/tmp/mx-build-queue`. |
 | `plugin/src/gs-modulix-update.c` | `refresh_metadata`/`update_apps` body: the synthetic "Modulix OS" `GsApp` (`GS_APP_SPECIAL_KIND_OS_UPDATE`), checked via `Store1.CheckUpdate`, described from `Store1.ListOutdatedInputs`, applied via `Daemon.UpdateSystem`, and after an interactive `"switch"` finished off with `Store1.RebootRequired`. See "System updates" below. |
 | `plugin/src/gs-modulix-icon-theme.c` | One-shot `GtkIconTheme` search-path setup (NixOS profile dirs + the plugin's resource icons), run before the resolver indexes the theme. |
 | `plugin/src/gs-modulix-config.h` | `MODULIX_ENABLE_PACKAGES`/`MODULIX_ENABLE_MODULES` feature flags + `MODULIX_SEARCH_LIMIT`, shared by the list and lifecycle sides. |
@@ -141,7 +141,7 @@ same app (one "Firefox" row) while still offering every source.
   same object is re-listed and re-refined. Icons (`gs_app_has_icons`),
   screenshots (`gs_app_get_screenshots`) and module addons
   (`modulix::addons-added` object data) are guarded; `gs_app_set_state` skips
-  the transient states owned by `enqueue_lifecycle` (`gs-modulix-lifecycle.c`) through
+  the transient states owned by `start_lifecycle` (`gs-modulix-lifecycle.c`) through
   its `state_is_transient` guard (`gs-modulix-app.c`);
   `gs_app_set_metadata` is write-once (`lib/gs-app.c` warns and returns on a
   second write of the same key), and `gs_app_set_license` only accepts a
@@ -299,7 +299,7 @@ emitting a partial `AND` chain.
 ### System updates
 
 There is no per-app "update" for a nix package or module — installing again
-via the lifecycle queue is how a newer version is picked up. The one thing
+via `gs-modulix-lifecycle.c` is how a newer version is picked up. The one thing
 that *is* an update is the NixOS system itself, backed by
 `Store1.CheckUpdate`, `Store1.ListOutdatedInputs` and
 `Store1.RebootRequired` (reads) and `Daemon.UpdateSystem` (write; the daemon
@@ -492,12 +492,13 @@ along with `Transaction::set_skip_rebuild`.
   `update_apps_async` calls `progress_callback` once with
   `GS_APP_PROGRESS_UNKNOWN` right before the blocking call starts —
   indeterminate bar, not a bar stuck at 0%.
-- **At most one system update runs at a time**, process-wide: a
-  `G_LOCK`-guarded static flag in `gs-modulix-update.c` (not the per-app
-  coalescing queue `gs-modulix-lifecycle.c` uses for install/uninstall — a
-  system update is a single app, single call, nothing to batch). A second
-  trigger while one is in flight fails immediately with
-  `GS_PLUGIN_ERROR_FAILED` rather than queuing.
+- **Concurrent updates are not guarded against client-side.** The old
+  `G_LOCK`-guarded `update_in_flight` flag (which failed a second trigger with
+  `GS_PLUGIN_ERROR_FAILED`) is gone, along with the install/uninstall
+  coalescing queue: `Daemon.UpdateSystem` is serialized daemon-side by the
+  build queue, so a second call just blocks its own `GTask` worker thread
+  until the first is done. Nothing in this repo queues, merges or rejects a
+  daemon call any more.
 
 ## Contracts (must match the real services)
 
@@ -633,4 +634,7 @@ generic status to GNOME Software, but the detail is logged).
 - `mx_store_*` write calls collapse every failure mode (bus down, D-Bus
   error, denied polkit prompt, daemon-side transaction failure) to `NULL`;
   `lifecycle_execute` reports a single generic `GS_PLUGIN_ERROR_FAILED` for
-  the whole batch rather than a per-app reason.
+  the whole request rather than a per-app reason. It does short-circuit the
+  remaining kinds at the first failure, but `lifecycle_thread` then rolls
+  every app still carrying the transient state back to `on_failure`, so none
+  is left stuck in `INSTALLING`/`REMOVING`.

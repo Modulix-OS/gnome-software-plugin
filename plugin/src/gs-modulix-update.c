@@ -312,26 +312,6 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
 
 /* ── update_apps ────────────────────────────────────────────────────────── */
 
-/** @brief Guards `update_in_flight` below: at most one system update runs at
- *   a time process-wide (see gs_modulix_update_apps_async()'s doc). */
-G_LOCK_DEFINE_STATIC(update_lock);
-static gboolean update_in_flight = FALSE;
-
-gboolean gs_modulix_update_try_acquire(void) {
-  G_LOCK(update_lock);
-  gboolean already = update_in_flight;
-  if (!already)
-    update_in_flight = TRUE;
-  G_UNLOCK(update_lock);
-  return !already;
-}
-
-void gs_modulix_update_release(void) {
-  G_LOCK(update_lock);
-  update_in_flight = FALSE;
-  G_UNLOCK(update_lock);
-}
-
 /**
  * @brief Maps GNOME Software's update flags onto a `Daemon.UpdateSystem` mode.
  *
@@ -464,8 +444,6 @@ static void update_run_thread(GTask *task,
   GError *error = NULL;
   gboolean ok = gs_modulix_update_run(d->plugin, d->app, d->flags, &error);
 
-  gs_modulix_update_release();
-
   if (ok)
     g_task_return_boolean(task, TRUE);
   else
@@ -513,13 +491,6 @@ void gs_modulix_update_apps_async(GsPlugin *plugin, GsAppList *list,
 
   if (app == NULL || no_op) {
     g_task_return_boolean(task, TRUE);
-    g_object_unref(task);
-    return;
-  }
-
-  if (!gs_modulix_update_try_acquire()) {
-    g_task_return_new_error(task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
-                            "A Modulix system update is already in progress");
     g_object_unref(task);
     return;
   }

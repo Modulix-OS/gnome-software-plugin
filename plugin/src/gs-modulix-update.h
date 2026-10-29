@@ -4,7 +4,7 @@
  *   `refresh_metadata`/`update_apps` vfunc bodies.
  *
  * Modulix has no per-app updates of its own (nix packages and modules are
- * reinstalled, not updated, via the lifecycle queue in gs-modulix-lifecycle.c)
+ * reinstalled, not updated, via gs-modulix-lifecycle.c)
  * — this file covers the one thing that *is* an update: the NixOS system
  * itself, driven by `org.modulix.Store1.CheckUpdate`,
  * `org.modulix.Store1.ListOutdatedInputs` and
@@ -257,11 +257,9 @@ gboolean gs_modulix_update_refresh_metadata_finish(GAsyncResult *result,
  * plugin used to do, mapping it to `"boot"` — silently ended the sequence
  * there.
  *
- * At most one update runs at a time process-wide: a second call while one is
- * already running fails immediately with `GS_PLUGIN_ERROR_FAILED`, without
- * touching the app's state, rather than queuing (unlike
- * gs-modulix-lifecycle.c's coalescing queue — a system update is a single
- * app, single call, not a batchable operation).
+ * Concurrent updates are not guarded against here: `Daemon.UpdateSystem` is
+ * serialized daemon-side by the build queue, so a second call simply blocks
+ * its own worker thread until the first one is done.
  *
  * @param plugin The plugin instance. Not NULL.
  * @param list Apps to update; only this plugin's "Modulix OS" app (if
@@ -299,34 +297,11 @@ void gs_modulix_update_apps_async(GsPlugin *plugin, GsAppList *list,
  * @brief Finishes gs_modulix_update_apps_async().
  *
  * @param result The GAsyncResult of the async call.
- * @param error Set on failure (a failed `UpdateSystem` call, an update
- *   already in flight, or cancellation); left untouched on success.
+ * @param error Set on failure (a failed `UpdateSystem` call or cancellation);
+ *   left untouched on success.
  * @return TRUE when the update succeeded or there was nothing of ours to
  *   update; FALSE with @p error set otherwise.
  */
 gboolean gs_modulix_update_apps_finish(GAsyncResult *result, GError **error);
-
-/**
- * @brief Claims the process-wide "a system rebuild is running" flag.
- *
- * `Daemon.UpdateSystem` is serialized daemon-side by the build queue, so two
- * concurrent callers would not corrupt anything — they would simply block for
- * minutes each. This flag is what lets the second one fail fast instead.
- *
- * @pre None; safe from any thread.
- * @post On TRUE, the flag is held until gs_modulix_update_release() is called;
- *   on FALSE nothing changed.
- * @return TRUE when the caller now owns the flag, FALSE when a rebuild was
- *   already in flight.
- */
-gboolean gs_modulix_update_try_acquire(void);
-
-/**
- * @brief Releases the flag gs_modulix_update_try_acquire() granted.
- *
- * @pre The caller obtained the flag and has not released it yet.
- * @post Another caller may claim it.
- */
-void gs_modulix_update_release(void);
 
 G_END_DECLS

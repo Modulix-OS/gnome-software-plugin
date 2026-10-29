@@ -11,18 +11,13 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # gnome-software patched with an explicit "GnomeSoftware::SortKey" metadata
-        # sort key, read *before* the packaging-format-preference GSetting in the
-        # details-page version-selector sort. Lets the Modulix plugin impose
-        # module > Flatpak > nix-variant ordering regardless of user settings.
         gnome-software-patched = pkgs.gnome-software.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [ ./nix/gs-details-page-sortkey.patch ];
         });
 
-        # ─── The plugin (.so) ───────────────────────────────────────────────
         plugin = pkgs.stdenv.mkDerivation {
           pname = "gnome-software-plugin-modulix";
-          version = "1.0.0";
+          version = "1.0.1";
           src = ./.;
 
           nativeBuildInputs = [
@@ -49,11 +44,6 @@
           };
         };
 
-        # ─── gnome-software bundled with the plugin (single package) ─────────
-        # The plugin loader uses a compiled-in plugin dir; there is no env var to
-        # add one, so the plugin .so is copied into gnome-software's own
-        # plugins-<api> directory. ABI matches: both derive from the same
-        # pkgs.gnome-software.
         gnome-software-modulix = gnome-software-patched.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             for d in ${plugin}/lib/gnome-software/plugins-*; do
@@ -68,9 +58,6 @@
           '';
         });
 
-        # ─── Dev runner: gnome-software with the locally-built plugin ────────
-        # bubblewrap overlays a tmp plugin dir (store plugins + our local .so)
-        # over the read-only store plugin dir, so no rebuild/root is needed.
         gnome-software-dev = pkgs.writeShellScriptBin "gnome-software-dev" ''
           set -e
           gs_plugindir=$(echo ${gnome-software-patched}/lib/gnome-software/plugins-*)

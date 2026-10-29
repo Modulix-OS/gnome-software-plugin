@@ -282,8 +282,8 @@ GIcon *gs_modulix_remote_icon_new(const gchar *url) {
  * @brief Tells whether @p state is owned by an in-flight install/uninstall
  *        and must not be overwritten by a listing refresh.
  *
- * States owned by an install/uninstall already under way (`enqueue_lifecycle`
- * in gs-modulix-lifecycle.c sets them on the main thread, the drain worker
+ * States owned by an install/uninstall already under way (`start_lifecycle`
+ * in gs-modulix-lifecycle.c sets them on the main thread, its #GTask worker
  * resolves them later). A listing that happens to run in between must not
  * stamp the daemon's — necessarily pre-operation — state over them.
  *
